@@ -1,0 +1,22 @@
+{
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/scripts/write_handoff.sh\" --session-start 2>/dev/null || true",
+            "timeout": 15,
+            "statusMessage": "Enabling git hooks and loading the branch hand-off"
+          }
+        ]
+      }
+    ]
+  }
+}
