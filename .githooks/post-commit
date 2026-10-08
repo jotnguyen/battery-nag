@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Git post-commit hook. Refreshes this branch's hand-off (scripts/write_handoff.sh).
+# Never fails the commit.
+root="$(git rev-parse --show-toplevel)" || exit 0
+bash "${root}/scripts/write_handoff.sh" >/dev/null 2>&1 || true

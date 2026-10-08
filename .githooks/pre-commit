@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Git pre-commit hook (core.hooksPath=.githooks, set by the Claude Code SessionStart
+# hook or `git config core.hooksPath .githooks`). Blocks the commit if the staged
+# content fails the hygiene gate or a staged shell file fails shellcheck. The lint
+# step is skipped on a machine without shellcheck; CI still runs it.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+fail=0
+bash scripts/hygiene.sh --cached >/dev/null || {
+  bash scripts/hygiene.sh --cached
+  fail=1
+}
+sh_files=()
+while IFS= read -r f; do
+  case "${f}" in
+    *.sh | openwrt/battery-nag | .githooks/*) sh_files+=("${f}") ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+if [ "${#sh_files[@]}" -gt 0 ]; then
+  if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck "${sh_files[@]}" || fail=1
+  else
+    echo "pre-commit: shellcheck not installed here, skipped (CI runs it)"
+  fi
+fi
+[ "${fail}" -eq 0 ] || echo "pre-commit: blocked. Fix the lines above; never bypass with --no-verify."
+exit "${fail}"

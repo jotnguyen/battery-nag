@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Git pre-push hook. Refreshes this branch's hand-off with its open PR, if gh can
+# see one. Never blocks the push.
+root="$(git rev-parse --show-toplevel)" || exit 0
+bash "${root}/scripts/write_handoff.sh" --pr >/dev/null 2>&1 || true
