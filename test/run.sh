@@ -66,15 +66,16 @@ printf 'DEVICE_NAME=Puli\nPUSHOVER_USER=u\nPUSHOVER_TOKEN=t\nPUSHOVER_URL=http:/
 BATTERY_NAG_READING="15 0" ${SH} openwrt/battery-nag check 2>/dev/null
 step 15 0 "p0 Puli battery 15%" "retried"
 
-echo "== not configured: check pushes nothing and leaves no state"
+echo "== not configured: check pushes nothing, but records that it ran"
 rm -f "${BATTERY_NAG_STATE}"
 printf 'DEVICE_NAME=Puli\n' >"${BATTERY_NAG_CONF}"
 BATTERY_NAG_READING="15 0" ${SH} openwrt/battery-nag check 2>/dev/null
-if [ -e "${BATTERY_NAG_STATE}" ]; then
-  echo "FAIL state written without keys"
-  fails=$((fails + 1))
+if grep -qx 'low=' "${BATTERY_NAG_STATE}" && grep -qx 'full=0' "${BATTERY_NAG_STATE}" \
+  && grep -qE '^checked=[0-9]+$' "${BATTERY_NAG_STATE}"; then
+  echo "ok   no keys -> no alert recorded, check time recorded"
 else
-  echo "ok   no keys -> no state"
+  echo "FAIL state without keys: $(tr '\n' ' ' <"${BATTERY_NAG_STATE}" 2>/dev/null)"
+  fails=$((fails + 1))
 fi
 
 echo "== config: full alert off, custom thresholds"

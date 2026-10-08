@@ -78,14 +78,24 @@ push() {
   fi
 }
 
-check() {
-  read_battery || { log "no reading from 'ubus call mcu status'"; return 1; }
-  [ "${DRY_RUN}" = 1 ] || configured || return 0
+load_state() {
   low=
   full=0
+  checked=
   # shellcheck source=/dev/null
   [ -r "${STATE}" ] && . "${STATE}"
+}
 
+# check: read the battery, push what is due, and record when it ran (status shows
+# that, so you can see cron is running even before the keys are set).
+check() {
+  read_battery || { log "no reading from 'ubus call mcu status'"; return 1; }
+  load_state
+  if [ "${DRY_RUN}" = 1 ] || configured; then alert; fi
+  printf 'low=%s\nfull=%s\nchecked=%s\n' "${low}" "${full}" "$(date +%s)" >"${STATE}"
+}
+
+alert() {
   # Re-arm only once the reading is REARM_GAP points back past the threshold, so a
   # reading that wobbles across a threshold pushes once.
   highest="${LOW_PERCENTS%% *}"
@@ -109,14 +119,10 @@ check() {
   elif [ -n "${FULL_PERCENT}" ] && [ "${full}" = 0 ] && [ "${percent}" -ge "${FULL_PERCENT}" ]; then
     push 0 "${DEVICE_NAME} charged ${percent}%" "Full. You can unplug it." && full=1
   fi
-  printf 'low=%s\nfull=%s\n' "${low}" "${full}" >"${STATE}"
 }
 
 status() {
-  low=
-  full=0
-  # shellcheck source=/dev/null
-  [ -r "${STATE}" ] && . "${STATE}"
+  load_state
   if ! read_battery; then
     echo "battery:  no reading from 'ubus call mcu status'"
   elif [ "${plugged}" = 1 ]; then
@@ -125,6 +131,11 @@ status() {
     echo "battery:  ${percent}%, on battery"
   fi
   echo "alerts:   low at ${LOW_PERCENTS} (pushed: ${low:-none}), full at ${FULL_PERCENT:-off} (pushed: ${full})"
+  if [ -n "${checked}" ]; then
+    echo "checked:  $(($(date +%s) - checked))s ago (cron runs it every 2 minutes)"
+  else
+    echo "checked:  not yet (cron runs it every 2 minutes)"
+  fi
   if configured; then
     echo "pushover: keys set"
   else
