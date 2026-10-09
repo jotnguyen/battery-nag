@@ -1,0 +1,263 @@
+#!/bin/sh
+# battery-nag: push a phone alert when a GL.iNet travel router's battery runs low,
+# and once more when it is full.
+#
+# The reading comes from GL.iNet's own battery daemon over ubus
+# (`ubus call mcu status`): no web login, no scraping, no change to GL.iNet files.
+# Tested on a GL-XE300 (Puli), firmware 4.8.4. Pushes go out through Pushover.
+#
+# Usage (on the router, as root):
+#   sh battery-nag install   # copy itself to /usr/bin, add the config and a cron line
+#   battery-nag setup        # ask for the Pushover keys, save them, send a test push
+#   battery-nag status       # the reading, which alerts have fired, the config
+#   battery-nag test         # send a test push
+#   battery-nag check        # what cron runs every 2 minutes; each alert pushes once
+#   battery-nag uninstall    # remove everything install added
+#
+# Config: /etc/battery-nag.conf (shell variables; install writes a commented one).
+# State:  /tmp/battery-nag.state (RAM, so a reboot re-arms every alert).
+# Tests:  BATTERY_NAG_READING="<percent> <plugged 0|1>" stands in for ubus, and
+#         DRY_RUN=1 prints pushes instead of sending them (see test/run.sh).
+set -u
+
+CONF="${BATTERY_NAG_CONF:-/etc/battery-nag.conf}"
+STATE="${BATTERY_NAG_STATE:-/tmp/battery-nag.state}"
+BIN=/usr/bin/battery-nag
+CRONTAB=/etc/crontabs/root
+CRON_LINE="*/2 * * * * ${BIN} check >/dev/null 2>&1"
+
+# Defaults; the config file overrides them.
+PUSHOVER_USER=
+PUSHOVER_TOKEN=
+PUSHOVER_URL=https://api.pushover.net/1/messages.json
+DEVICE_NAME=Router
+LOW_PERCENTS="20 10"
+FULL_PERCENT=100
+REARM_GAP=5
+# shellcheck source=/dev/null
+[ -r "${CONF}" ] && . "${CONF}"
+DRY_RUN="${DRY_RUN:-0}"
+
+log() {
+  logger -t battery-nag "$*" 2>/dev/null || true
+  echo "battery-nag: $*" >&2
+}
+
+configured() { [ -n "${PUSHOVER_USER}" ] && [ -n "${PUSHOVER_TOKEN}" ]; }
+
+# read_battery: set percent (0-100) and plugged (1 on external power, 0 on battery).
+read_battery() {
+  if [ -n "${BATTERY_NAG_READING:-}" ]; then
+    percent="${BATTERY_NAG_READING% *}"
+    plugged="${BATTERY_NAG_READING#* }"
+  else
+    json="$(ubus call mcu status 2>/dev/null)" || return 1
+    percent="$(printf '%s' "${json}" | jsonfilter -e '@.charge_percent')"
+    # The daemon fills charging_status from its "plugged" flag: 1 while on external
+    # power, whether charging or full; 0 on battery.
+    plugged="$(printf '%s' "${json}" | jsonfilter -e '@.charging_status')"
+  fi
+  case "${percent}" in '' | *[!0-9]*) return 1 ;; esac
+  case "${plugged}" in 0) ;; '') return 1 ;; *) plugged=1 ;; esac
+}
+
+# push <priority> <title> <message>. Pushover priority 0 is a normal push; 1 also
+# sounds during quiet hours.
+push() {
+  if [ "${DRY_RUN}" = 1 ]; then
+    echo "DRY RUN push p$1: $2: $3"
+    return 0
+  fi
+  if curl -fsS --max-time 20 "${PUSHOVER_URL}" \
+    --form-string "token=${PUSHOVER_TOKEN}" --form-string "user=${PUSHOVER_USER}" \
+    --form-string "priority=$1" --form-string "title=$2" --form-string "message=$3" >/dev/null; then
+    log "pushed: $2"
+  else
+    log "push failed (no uplink, or wrong keys); will retry next run: $2"
+    return 1
+  fi
+}
+
+load_state() {
+  low=
+  full=0
+  checked=
+  # shellcheck source=/dev/null
+  [ -r "${STATE}" ] && . "${STATE}"
+}
+
+# check: read the battery, push what is due, and record when it ran (status shows
+# that, so you can see cron is running even before the keys are set).
+check() {
+  read_battery || { log "no reading from 'ubus call mcu status'"; return 1; }
+  load_state
+  if [ "${DRY_RUN}" = 1 ] || configured; then alert; fi
+  printf 'low=%s\nfull=%s\nchecked=%s\n' "${low}" "${full}" "$(date +%s)" >"${STATE}"
+}
+
+alert() {
+  # Re-arm only once the reading is REARM_GAP points back past the threshold, so a
+  # reading that wobbles across a threshold pushes once.
+  highest="${LOW_PERCENTS%% *}"
+  if [ -n "${low}" ] && [ "${percent}" -ge $((highest + REARM_GAP)) ]; then low=; fi
+  if [ "${full}" = 1 ] && [ "${percent}" -le $((${FULL_PERCENT:-100} - REARM_GAP)) ]; then full=0; fi
+
+  if [ "${plugged}" = 0 ]; then
+    # The lowest threshold the reading is at or under that has not pushed yet. A
+    # reading that skips past several thresholds pushes once, for the lowest.
+    hit=
+    for t in ${LOW_PERCENTS}; do
+      if [ "${percent}" -le "${t}" ] && { [ -z "${low}" ] || [ "${t}" -lt "${low}" ]; }; then
+        hit="${t}"
+      fi
+    done
+    if [ -n "${hit}" ] && [ "${hit}" = "${LOW_PERCENTS##* }" ]; then
+      push 1 "${DEVICE_NAME} battery ${percent}%" "About to shut down. Plug it in now." && low="${hit}"
+    elif [ -n "${hit}" ]; then
+      push 0 "${DEVICE_NAME} battery ${percent}%" "Running on battery. Charge it soon." && low="${hit}"
+    fi
+  elif [ -n "${FULL_PERCENT}" ] && [ "${full}" = 0 ] && [ "${percent}" -ge "${FULL_PERCENT}" ]; then
+    push 0 "${DEVICE_NAME} charged ${percent}%" "Full. You can unplug it." && full=1
+  fi
+}
+
+status() {
+  load_state
+  if ! read_battery; then
+    echo "battery:  no reading from 'ubus call mcu status'"
+  elif [ "${plugged}" = 1 ]; then
+    echo "battery:  ${percent}%, plugged in"
+  else
+    echo "battery:  ${percent}%, on battery"
+  fi
+  echo "alerts:   low at ${LOW_PERCENTS} (pushed: ${low:-none}), full at ${FULL_PERCENT:-off} (pushed: ${full})"
+  if [ -n "${checked}" ]; then
+    echo "checked:  $(($(date +%s) - checked))s ago (cron runs it every 2 minutes)"
+  else
+    echo "checked:  not yet (cron runs it every 2 minutes)"
+  fi
+  if configured; then
+    echo "pushover: keys set"
+  else
+    echo "pushover: keys MISSING, run: battery-nag setup"
+  fi
+}
+
+test_push() {
+  configured || { echo "no Pushover keys in ${CONF}; run: battery-nag setup" >&2; return 1; }
+  read_battery || percent='?'
+  push 0 "${DEVICE_NAME} battery-nag test" "Alerts work. Battery is at ${percent}%." && echo "test push sent"
+}
+
+setup() {
+  [ -w "${CONF}" ] || { echo "cannot write ${CONF}; run install first" >&2; return 1; }
+  printf 'Pushover user key (top of the pushover.net dashboard): '
+  read -r user
+  printf 'Pushover API token (an app for this router, pushover.net/apps/build): '
+  read -r token
+  for key in "${user}" "${token}"; do
+    case "${key}" in
+      '' | *[!A-Za-z0-9]*)
+        echo "Pushover keys are letters and digits only; nothing saved" >&2
+        return 1
+        ;;
+    esac
+  done
+  sed -i -e "s/^PUSHOVER_USER=.*/PUSHOVER_USER=${user}/" \
+    -e "s/^PUSHOVER_TOKEN=.*/PUSHOVER_TOKEN=${token}/" "${CONF}"
+  chmod 600 "${CONF}"
+  # shellcheck source=/dev/null
+  . "${CONF}"
+  if [ "${PUSHOVER_USER}" != "${user}" ] || [ "${PUSHOVER_TOKEN}" != "${token}" ]; then
+    echo "could not save the keys: ${CONF} needs PUSHOVER_USER= and PUSHOVER_TOKEN= lines" >&2
+    return 1
+  fi
+  echo "saved to ${CONF}"
+  test_push
+}
+
+write_conf() {
+  cat >"${CONF}" <<'EOF'
+# battery-nag config, sourced as shell by /usr/bin/battery-nag.
+# It holds your Pushover keys, so it stays private (mode 600).
+# Fill the keys with `battery-nag setup`, or edit here and run `battery-nag test`.
+
+# Your user key (top of the pushover.net dashboard) and an API token from an
+# application made for this router at https://pushover.net/apps/build.
+PUSHOVER_USER=
+PUSHOVER_TOKEN=
+
+# The name in the alert title, e.g. "Puli battery 19%".
+DEVICE_NAME=Router
+
+# On battery and at or under each of these: push once. Highest first. The last
+# one is urgent (Pushover priority 1: it sounds during quiet hours too).
+LOW_PERCENTS="20 10"
+
+# Plugged in and at or over this: push once. Empty turns it off.
+FULL_PERCENT=100
+
+# An alert re-arms once the battery is this many points back past its threshold.
+REARM_GAP=5
+EOF
+}
+
+# append_line <file> <line>: add the line unless it is there, after a final newline.
+append_line() {
+  grep -qxF "$2" "$1" 2>/dev/null && return 0
+  [ ! -s "$1" ] || [ -z "$(tail -c 1 "$1")" ] || echo >>"$1"
+  echo "$2" >>"$1"
+}
+
+install() {
+  if ! ubus call mcu status >/dev/null 2>&1; then
+    echo "install: 'ubus call mcu status' failed: no GL.iNet battery daemon here" >&2
+    return 1
+  fi
+  command -v curl >/dev/null || { echo "install: needs curl (opkg install curl)" >&2; return 1; }
+
+  cp "$0" "${BIN}.new" && chmod 755 "${BIN}.new" && mv "${BIN}.new" "${BIN}" || return 1
+  [ -f "${CONF}" ] || write_conf
+  chmod 600 "${CONF}"
+
+  # The stock OpenWrt cron service runs crond on /etc/crontabs, and only once that
+  # folder has a file in it. GL.iNet runs a separate crond on /tmp/gl_crontabs,
+  # which this leaves alone.
+  sed -i '/battery-nag check/d' "${CRONTAB}" 2>/dev/null
+  append_line "${CRONTAB}" "${CRON_LINE}"
+  /etc/init.d/cron enable
+  /etc/init.d/cron restart
+
+  # Keep both files through a firmware upgrade that keeps settings
+  # (/etc/crontabs/ is kept already).
+  append_line /etc/sysupgrade.conf "${BIN}"
+  append_line /etc/sysupgrade.conf "${CONF}"
+
+  echo "battery-nag installed."
+  status
+}
+
+uninstall() {
+  if [ -f "${CRONTAB}" ]; then
+    sed -i '/battery-nag/d' "${CRONTAB}"
+    # An empty /etc/crontabs leaves the stock cron service idle, as shipped.
+    [ -s "${CRONTAB}" ] || rm -f "${CRONTAB}"
+  fi
+  /etc/init.d/cron restart 2>/dev/null
+  sed -i -e "\\#^${BIN}\$#d" -e "\\#^${CONF}\$#d" /etc/sysupgrade.conf
+  rm -f "${BIN}" "${CONF}" "${STATE}"
+  echo "battery-nag removed."
+}
+
+case "${1:-}" in
+  check) check ;;
+  status) status ;;
+  setup) setup ;;
+  test) test_push ;;
+  install) install ;;
+  uninstall) uninstall ;;
+  *)
+    echo "usage: battery-nag install|setup|status|test|check|uninstall" >&2
+    exit 2
+    ;;
+esac

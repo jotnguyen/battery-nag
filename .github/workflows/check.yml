@@ -1,0 +1,21 @@
+---
+name: check
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hygiene (no personal data or secrets)
+        run: bash scripts/hygiene.sh
+      - name: Shellcheck
+        run: shellcheck openwrt/battery-nag test/run.sh scripts/*.sh .githooks/*
+      - name: Scenario tests (dash)
+        run: sh test/run.sh
+      - name: Scenario tests (BusyBox ash, the router's shell)
+        run: |
+          sudo apt-get install -y busybox >/dev/null
+          SH="busybox sh" busybox sh test/run.sh
