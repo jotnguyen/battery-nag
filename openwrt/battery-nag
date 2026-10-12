@@ -31,7 +31,7 @@ PUSHOVER_USER=
 PUSHOVER_TOKEN=
 PUSHOVER_URL=https://api.pushover.net/1/messages.json
 DEVICE_NAME=Router
-LOW_PERCENTS="20 10"
+LOW_PERCENTS="30 20 10"
 FULL_PERCENT=100
 REARM_GAP=5
 # shellcheck source=/dev/null
@@ -187,12 +187,12 @@ write_conf() {
 PUSHOVER_USER=
 PUSHOVER_TOKEN=
 
-# The name in the alert title, e.g. "Puli battery 19%".
+# The name in the alert title, e.g. "Puli battery 29%".
 DEVICE_NAME=Router
 
 # On battery and at or under each of these: push once. Highest first. The last
 # one is urgent (Pushover priority 1: it sounds during quiet hours too).
-LOW_PERCENTS="20 10"
+LOW_PERCENTS="30 20 10"
 
 # Plugged in and at or over this: push once. Empty turns it off.
 FULL_PERCENT=100

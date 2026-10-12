@@ -67,7 +67,7 @@ goes nowhere.
 
 ## Acceptance
 
-- On battery, one push at 20% and one at 10%. Plugged in, one push at 100%.
+- On battery, one push each at 30%, 20% and 10%. Plugged in, one push at 100%.
 - Nothing pushes while the battery is healthy, and a reading wobbling around a
   threshold pushes once.
 - A failed push goes out on a later run.

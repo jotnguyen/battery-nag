@@ -35,22 +35,25 @@ step() {
   fi
 }
 
-echo "== low and full alerts, defaults (low 20 10, full 100, gap 5)"
+echo "== low and full alerts, defaults (low 30 20 10, full 100, gap 5)"
 printf 'DEVICE_NAME=Puli\n' >"${BATTERY_NAG_CONF}"
 step 50 0 -
+step 31 0 -
+step 30 0 "p0 Puli battery 30%" "the first reminder"
+step 29 0 - "already pushed"
+step 31 0 - "wobble: no re-arm under 35"
 step 21 0 -
 step 20 0 "p0 Puli battery 20%"
 step 19 0 - "already pushed"
-step 21 0 - "wobble: no re-arm under 25"
 step 20 0 -
 step 10 0 "p1 Puli battery 10%" "the last threshold is urgent"
 step 5 0 -
 step 6 1 - "plugged in: no low alert while charging"
-step 24 1 -
-step 25 1 - "re-armed at 20 + 5"
-step 20 0 "p0 Puli battery 20%"
-step 30 1 -
-step 9 0 "p1 Puli battery 9%" "skipped past 20 and 10: one push, the urgent one"
+step 34 1 -
+step 35 1 - "re-armed at 30 + 5"
+step 20 0 "p0 Puli battery 20%" "skipped past 30: one push, for 20"
+step 40 1 -
+step 9 0 "p1 Puli battery 9%" "skipped past 30, 20 and 10: one push, the urgent one"
 step 99 1 -
 step 100 1 "p0 Puli charged 100%"
 step 100 1 - "already pushed"

@@ -2,7 +2,7 @@
 
 A GL.iNet travel router shuts down without a word when its battery runs flat, and
 takes your connection with it. battery-nag makes it warn you first: a push to your
-phone at 20% and again at 10%, and one more when it is fully charged.
+phone at 30%, again at 20% and at 10%, and one more when it is fully charged.
 
 It runs on the router itself, so it works wherever the router has an uplink, with
 no phone app polling it and no laptop switched on. It reads the battery from
@@ -17,13 +17,14 @@ routers with a battery should work if `ubus call mcu status` prints a
 
 | When | Push |
 |---|---|
+| On battery, at or under 30% | **Router battery 29%** Running on battery. Charge it soon. |
 | On battery, at or under 20% | **Router battery 19%** Running on battery. Charge it soon. |
 | On battery, at or under 10% | **Router battery 9%** About to shut down. Plug it in now. (urgent: sounds during Pushover quiet hours) |
 | Plugged in, at 100% | **Router charged 100%** Full. You can unplug it. |
 
 Each alert pushes once. It re-arms when the battery is 5 points back past the
-threshold (25% for the low alerts, 95% for full), so a reading that wobbles around
-20% doesn't push twice. The thresholds, the name in the title, and the gap are
+threshold (35% for the low alerts, 95% for full), so a reading that wobbles around
+30% doesn't push twice. The thresholds, the name in the title, and the gap are
 all set in the config.
 
 ## Install
