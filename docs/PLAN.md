@@ -53,6 +53,9 @@ goes nowhere.
 
 ## Later, if wanted
 
+Open tickets with a plan are in [docs/ticket/](ticket/): 0001 cellular-only alert, 0002 daily
+summary and low balance, 0003 per-device day totals, 0004 shared code and install tests.
+
 - **Cellular data alert.** Done as [data-nag](data-nag.md): a push at every
   250 MB of cellular data in a day, urgent from 1 GB. Written after a day of
   streaming and a Windows update went over a travel eSIM with the Wi-Fi uplink off.
