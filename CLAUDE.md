@@ -1,7 +1,7 @@
-# CLAUDE.md — battery-nag
+# CLAUDE.md — glinet-utilities
 
-A public repo: a battery alert that runs on a GL.iNet router. Read `README.md`, then
-`docs/PLAN.md` (decisions, status, what is left).
+A public repo: phone alerts that run on a GL.iNet router (battery-nag, data-nag).
+Read `README.md`, then `docs/PLAN.md` (decisions, status, what is left).
 
 ## Non-negotiables
 
@@ -15,8 +15,8 @@ A public repo: a battery alert that runs on a GL.iNet router. Read `README.md`, 
 - **On a real router:** back up first (`sysupgrade -b`, copied somewhere private, never
   into this repo), stay read-only until the owner agrees to a change, and never type a
   password (key auth only).
-- `openwrt/battery-nag` runs on BusyBox ash: POSIX sh only. `sh test/run.sh` must pass;
-  CI also runs it under BusyBox, plus shellcheck.
+- `openwrt/*` run on BusyBox ash: POSIX sh only. `sh test/run.sh` and `sh test/data-nag.sh` must pass;
+  CI also runs them under BusyBox, plus shellcheck.
 
 ## Hand-off
 
