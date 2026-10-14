@@ -57,7 +57,7 @@ expect() {
 }
 
 # has <text> <needle>: true when the text contains the needle (called through expect).
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
 echo "== a push every 500 MB, urgent from 2 GB, a day starting at noon"
