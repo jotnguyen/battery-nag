@@ -25,11 +25,12 @@
 #
 # Config: /etc/data-nag.conf (shell variables). If it has no Pushover keys, the
 #         ones in /etc/battery-nag.conf are used.
-# State:  /tmp/data-nag.state and /tmp/data-nag.state.dev (RAM, so a reboot starts
+# State:  /tmp/data-nag.state, .state.flows and .state.dev (RAM, so a reboot starts
 #         the count again; the modem's counter starts again at a reboot too).
 # Tests:  DATA_NAG_BYTES="<total bytes>" stands in for the counter, DATA_NAG_NOW
 #         for the clock, DATA_NAG_WIFI=0|1 for the Wi-Fi uplink, DATA_NAG_CONNTRACK
 #         and DATA_NAG_LEASES for the connection table and DHCP leases, and
+#         DATA_NAG_UCI_NETWORK and DATA_NAG_EIOTCLUB_JSON for eiotclub, and
 #         DRY_RUN=1 prints pushes instead of sending them (see test/data-nag.sh).
 set -u
 
@@ -186,98 +187,138 @@ lan_prefix() {
 }
 
 # cell_ip: the cellular interface's IPv4 address, so only flows that leave over
-# the SIM count. Empty when unknown, and then every flow counts.
+# the SIM count. Empty when unknown, and then no device is named.
 cell_ip() {
   if [ -n "${DATA_NAG_BYTES:-}" ]; then
     echo "${DATA_NAG_CELL_IP:-}"
   else
-    ip -4 -o addr show dev "${CELL_DEV}" 2>/dev/null | awk '{ sub("/.*", "", $4); print $4; exit }'
+    ip -4 addr show dev "${CELL_DEV}" 2>/dev/null | awk '$1 == "inet" { sub("/.*", "", $2); print $2; exit }'
   fi
 }
 
-# devices: one line per LAN device, "<address> <bytes> <kind of traffic>", summed
-# over its live connections (both directions) in the kernel's connection table.
-# The kind is the one with the most bytes, guessed from protocol and port.
+# devices: one line per LAN device, "<address> <bytes since last check> <kind>",
+# for connections that leave over the cellular address. Bytes are counted per
+# connection against the last check's table (${STATE}.flows), so connections that
+# open and close between checks still count, and a closed one can't make a
+# device's total go backwards. The kind is the one with the most of those bytes,
+# guessed from protocol and port. Prints nothing on the first check, which only
+# records the table.
 devices() {
-  [ -r "${CONNTRACK}" ] || return 0
-  awk -v pre="$(lan_prefix)" -v wan="$(cell_ip)" '{
-    src = ""; dst2 = ""; sport = ""; dport = ""; b = 0; nd = 0; proto = $3
+  wan="$(cell_ip)"
+  { [ -r "${CONNTRACK}" ] && [ -n "${wan}" ]; } || { rm -f "${STATE}.flows"; return 0; }
+  first=0
+  [ -r "${STATE}.flows" ] || { first=1; : >"${STATE}.flows"; }
+  : >"${STATE}.flows.new"
+  awk -v pre="$(lan_prefix)" -v wan="${wan}" -v pf="${STATE}.flows" -v out="${STATE}.flows.new" -v first="${first}" '
+  FILENAME == pf { p[$1] = $2; next }
+  {
+    src = ""; dst = ""; dst2 = ""; sport = ""; dport = ""; b = 0; nd = 0; proto = $3
     for (i = 1; i <= NF; i++) {
       if ($i ~ /^src=/) { if (src == "") src = substr($i, 5) }
-      else if ($i ~ /^dst=/) { if (++nd == 2) dst2 = substr($i, 5) }
+      else if ($i ~ /^dst=/) { if (++nd == 1) dst = substr($i, 5); else if (nd == 2) dst2 = substr($i, 5) }
       else if ($i ~ /^sport=/) { if (sport == "") sport = substr($i, 7) }
       else if ($i ~ /^dport=/) { if (dport == "") dport = substr($i, 7) }
       else if ($i ~ /^bytes=/) b += substr($i, 7)
     }
-    if (index(src, pre) != 1 || (wan != "" && dst2 != wan)) next
-    if (proto == "udp" && (sport == "41641" || dport == "41641")) k = "Tailscale tunnel"
+    if (index(src, pre) != 1 || dst2 != wan) next
+    key = proto "/" src ":" sport ">" dst ":" dport
+    printf "%s %.0f\n", key, b > out
+    d = (key in p && b >= p[key]) ? b - p[key] : b
+    if (proto == "udp" && (sport == "41641" || dport == "41641" || dport == "3478")) k = "Tailscale tunnel"
     else if (proto == "udp" && dport == "443") k = "QUIC (YouTube, Google)"
     else if (proto == "tcp" && dport == "443") k = "HTTPS"
     else if (proto == "tcp" && dport == "80") k = "HTTP (often OS updates)"
     else if (dport == "53") k = "DNS"
     else if (proto == "udp" && dport == "51820") k = "WireGuard VPN"
     else k = "other"
-    tot[src] += b; per[src SUBSEP k] += b; kinds[k] = 1
+    tot[src] += d; per[src SUBSEP k] += d; kinds[k] = 1
   } END {
-    for (d in tot) {
+    if (first) exit
+    for (s in tot) {
+      if (tot[s] <= 0) continue
       best = ""; bb = -1
-      for (k in kinds) if (per[d SUBSEP k] > bb) { bb = per[d SUBSEP k]; best = k }
-      printf "%s %.0f %s\n", d, tot[d], best
-    } }' "${CONNTRACK}"
+      for (k in kinds) if (per[s SUBSEP k] > bb) { bb = per[s SUBSEP k]; best = k }
+      printf "%s %.0f %s\n", s, tot[s], best
+    } }' "${STATE}.flows" "${CONNTRACK}"
+  mv "${STATE}.flows.new" "${STATE}.flows"
 }
 
-# top_device <seconds since last check>: set top to "laptop, 15 Mbit/s, HTTPS":
-# the device whose connections grew the most since the last check, named from
-# the DHCP leases. Saves this check's table for the next one.
+# top_device <seconds since last check>: set top to "laptop, 15 Mbit/s, HTTPS",
+# the device that moved the most cellular bytes since the last check, named from
+# the DHCP leases. Keeps the per-device table in ${STATE}.dev for status.
 top_device() {
-  top=
-  prev="${STATE}.dev"
-  cur="${STATE}.cur"
-  devices >"${cur}"
-  [ -s "${cur}" ] || { rm -f "${cur}" "${prev}"; return 0; }
-  [ -r "${prev}" ] || : >"${prev}"
-  top="$(awk -v el="$1" -v leases="${LEASES}" -v pf="${prev}" '
+  devices >"${STATE}.dev"
+  top="$(sort -k2,2nr "${STATE}.dev" | head -n 1 | awk -v el="$1" -v leases="${LEASES}" '
     BEGIN { while ((getline l < leases) > 0) { split(l, f, " "); if (f[4] != "*") name[f[3]] = f[4] } }
-    FILENAME == pf { p[$1] = $2; next }
-    { d = ($1 in p) ? $2 - p[$1] : 0; if (d < 0) d = 0
+    { n = ($1 in name) ? name[$1] : $1
       k = $3; for (i = 4; i <= NF; i++) k = k " " $i
-      if (d > bd || (bd == 0 && d == 0 && $2 > bt)) { bd = d; bt = $2; who = $1; kind = k } }
-    END { if (who == "") exit
-      n = (who in name) ? name[who] : who
-      if (bd > 0 && el > 0) { r = bd * 8 / el / 1000; rs = (r >= 1000) ? sprintf("%d Mbit/s", r / 1000) : sprintf("%d kbit/s", r); print n ", " rs ", " kind }
-      else print n ", " kind }' "${prev}" "${cur}")"
-  mv "${cur}" "${prev}"
+      if (el > 0) { r = $2 * 8 / el / 1000; rs = (r >= 1000) ? sprintf("%d Mbit/s", r / 1000) : sprintf("%d kbit/s", r); print n ", " rs ", " k }
+      else print n ", " k }')"
 }
 
 # balance: the first line BALANCE_CMD prints, e.g. what the SIM provider says is
-# left. Empty when BALANCE_CMD is unset or fails.
+# left. Empty when BALANCE_CMD is unset or fails. Capped at 30 seconds where the
+# firmware has `timeout`, so a hung command can't hold up the push.
 balance() {
   [ -n "${BALANCE_CMD}" ] || return 0
-  eval "${BALANCE_CMD}" 2>/dev/null | head -n 1
+  if timeout 1 true 2>/dev/null; then
+    timeout 30 sh -c "${BALANCE_CMD}" 2>/dev/null | head -n 1
+  else
+    eval "${BALANCE_CMD}" 2>/dev/null | head -n 1
+  fi
+}
+
+# network_iccid: the ICCID of the modem interface in /etc/config/network, the
+# enabled one if there are several (dual-SIM), else the first.
+network_iccid() {
+  { if [ -n "${DATA_NAG_UCI_NETWORK:-}" ]; then printf '%s\n' "${DATA_NAG_UCI_NETWORK}"; else uci -q show network 2>/dev/null; fi; } \
+    | awk -F'[.=]' '
+      $3 == "iccid" { v = $4; gsub(/[^0-9]/, "", v); ic[$2] = v; order[++n] = $2 }
+      $3 == "disabled" { dis[$2] = $4 }
+      END { for (i = 1; i <= n; i++) if (dis[order[i]] !~ /1/) { print ic[order[i]]; exit }
+            if (n) print ic[order[1]] }'
 }
 
 # eiotclub: print an EIOTCLUB eSIM's balance from the provider's own shop page API,
 # which answers by ICCID alone. The ICCID comes from ICCID= in the config, or from
 # the modem interface in /etc/config/network.
 eiotclub() {
-  iccid="${ICCID:-$(uci -q show network 2>/dev/null | sed -n "s/^network\.[^.]*\.iccid='\{0,1\}\([0-9]*\)'\{0,1\}\$/\1/p" | head -n 1)}"
+  iccid="${ICCID:-$(network_iccid)}"
   [ -n "${iccid}" ] || { echo "eiotclub: no ICCID; set ICCID= in ${CONF}" >&2; return 1; }
-  json="$(curl -fsS --max-time 15 -X POST "${EIOTCLUB_URL}" -H 'Content-Type: application/json' \
-    -d "{\"iccid\":\"${iccid}\"}")" || return 1
-  left="$(printf '%s' "${json}" | jsonfilter -e '@.data.remain_str')"
-  total="$(printf '%s' "${json}" | jsonfilter -e '@.data.total_str')"
+  if [ -n "${DATA_NAG_EIOTCLUB_JSON:-}" ]; then
+    json="$(printf '%s' "${DATA_NAG_EIOTCLUB_JSON}" | sed "s/@ICCID@/${iccid}/g")"
+  else
+    json="$(curl -fsS --max-time 15 -X POST "${EIOTCLUB_URL}" -H 'Content-Type: application/json' \
+      -d "{\"iccid\":\"${iccid}\"}")" || return 1
+  fi
+  left="$(printf '%s' "${json}" | sed -n 's/.*"remain_str" *: *"\([^"]*\)".*/\1/p')"
+  total="$(printf '%s' "${json}" | sed -n 's/.*"total_str" *: *"\([^"]*\)".*/\1/p')"
   [ -n "${left}" ] || { echo "eiotclub: no balance in the answer" >&2; return 1; }
-  echo "eSIM left: ${left} of ${total} (EIOTCLUB's count, hours behind)"
+  echo "eSIM left: ${left} of ${total:-?} (EIOTCLUB's count, hours behind)"
+}
+
+# lock: one check at a time, so two runs can't both add the same bytes. A lock
+# left by a run that died is taken over.
+lock() {
+  if ! mkdir "${STATE}.lock" 2>/dev/null; then
+    pid="$(cat "${STATE}.lock/pid" 2>/dev/null)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then return 1; fi
+    rm -rf "${STATE}.lock"
+    mkdir "${STATE}.lock" 2>/dev/null || return 1
+  fi
+  echo "$$" >"${STATE}.lock/pid"
+  trap 'rm -rf "${STATE}.lock"' EXIT
 }
 
 # check: add the bytes since the last run to the day's count, push when it crosses
 # the next STEP_MB, and record the state.
 check() {
+  lock || { log "another check is still running; skipped"; return 0; }
   t="$(now)"
   load_state
   if ! read_bytes; then
-    # No modem device: nothing to count. Keep the state so the next reading adds on.
-    checked="${t}"
+    # No modem device: nothing to count. Keep the state, and the time of the last
+    # reading, so the next reading adds on and its rate covers the whole gap.
     rate=0
     save_state
     return 0
@@ -305,7 +346,13 @@ check() {
     rate=$((delta * 8 / elapsed / 1000))
   fi
   add_hist "${t}" "${delta}"
-  top_device "${elapsed}"
+  top=
+  if [ "${delta}" -gt 0 ]; then
+    top_device "${elapsed}"
+  else
+    # Cellular is idle: nothing to attribute, so skip the connection table.
+    rm -f "${STATE}.flows" "${STATE}.dev"
+  fi
   last="${bytes}"
   checked="${t}"
   if [ "${DRY_RUN}" = 1 ] || configured; then alert; fi
@@ -353,7 +400,7 @@ status() {
   fi
   line="$(spark)"
   [ -z "${line}" ] || echo "history:  ${line}"
-  [ ! -s "${STATE}.dev" ] || echo "devices:  $(sort -k2,2nr "${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (live connections)"
+  [ ! -s "${STATE}.dev" ] || echo "devices:  $(sort -k2,2nr "${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (cellular bytes at the last check)"
   line="$(balance)"
   [ -z "${line}" ] || echo "balance:  ${line}"
   urgent=never
@@ -476,7 +523,7 @@ install() {
   append_line /etc/sysupgrade.conf "${CONF}"
 
   # Start counting from now, not from the bytes used since boot.
-  rm -f "${STATE}" "${STATE}.dev" "${STATE}.cur"
+  rm -rf "${STATE}" "${STATE}.dev" "${STATE}.flows" "${STATE}.flows.new" "${STATE}.lock"
   check
   echo "data-nag installed."
   status
@@ -490,7 +537,7 @@ uninstall() {
   fi
   /etc/init.d/cron restart 2>/dev/null
   sed -i -e "\\#^${BIN}\$#d" -e "\\#^${CONF}\$#d" /etc/sysupgrade.conf
-  rm -f "${BIN}" "${CONF}" "${STATE}" "${STATE}.dev" "${STATE}.cur"
+  rm -rf "${BIN}" "${CONF}" "${STATE}" "${STATE}.dev" "${STATE}.flows" "${STATE}.flows.new" "${STATE}.lock"
   echo "data-nag removed."
 }
 

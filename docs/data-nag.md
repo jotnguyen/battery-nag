@@ -24,7 +24,7 @@ Pushover keys if they are there.
 | Amount, rate | The modem's byte counter, every 2 minutes. The rate only shows from 1 Mbit/s |
 | Wi-Fi uplink | Whether GL.iNet's repeater interface is up. If the router is on the SIM because the repeater is off, that's the thing to fix |
 | Bar line | The cellular bytes per 10 minutes over the last 3 hours, scaled to the tallest bar. Shows once there are two bars |
-| Top now | The device whose connections grew most since the last check, named from the DHCP leases, with the kind of traffic most of its bytes are |
+| Top now | The device that moved the most cellular bytes since the last check, named from the DHCP leases, with the kind of traffic most of those bytes were |
 | Balance | Optional: the first line of `BALANCE_CMD`, e.g. what the SIM provider says is left |
 
 Pushes come at 250 MB, 500 MB, 750 MB and so on. A jump past several steps between two
@@ -44,7 +44,8 @@ The router can't see inside HTTPS, so the kind is a guess from protocol and port
 | DNS, WireGuard VPN, other | port 53, UDP 51820, anything else | |
 
 A device that sends everything through a Tailscale exit node or a VPN shows up as
-one tunnel. On that device itself, Windows records which app used how much per
+one tunnel. Tailscale relayed over its DERP servers (TCP 443) shows as HTTPS.
+On that device itself, Windows records which app used how much per
 network and per hour: Settings, Network & internet, Data usage.
 
 ## How it counts
@@ -65,8 +66,11 @@ network and per hour: Settings, Network & internet, Data usage.
 - **Per device** it reads the kernel's connection table (`/proc/net/nf_conntrack`,
   which counts bytes per connection when `net.netfilter.nf_conntrack_acct` is 1, as
   on GL.iNet 4.x). Only connections whose replies come back to the cellular
-  address count. A connection that has closed is gone from the table, so "top"
-  means busy right now, not over the day.
+  address count. Each connection's bytes are compared with the last check's, so a
+  download spread over many short connections still counts. Bytes a connection
+  moved after the last check but before it closed are missed. The first check
+  after cellular starts moving data only records the table, and nothing is named
+  while the cellular address is unknown.
 - **Nothing is written to flash** except the config at install. The count, the bars
   and the last device table live in `/tmp/data-nag.state*` (RAM).
 
@@ -93,7 +97,7 @@ Two things to know about that number:
 - **It runs hours behind.** Use it for "how much is left", and the router's count
   for "what is happening now".
 
-Anyone who has an EIOTCLUB ICCID can read that eSIM's balance, and more, from this
+Anyone who has an EIOTCLUB ICCID can read that eSIM's balance from this
 API. Treat the ICCID as private: it's printed in the app, on the order page and in
 the shop URL.
 
@@ -119,7 +123,7 @@ Pushover keys.
 | `/etc/data-nag.conf` | Config, mode 600 |
 | `/etc/crontabs/root` | One line: `data-nag check` every 2 minutes |
 | `/etc/sysupgrade.conf` | Two lines, so a firmware upgrade that keeps settings keeps both files |
-| `/tmp/data-nag.state`, `.state.dev` | The day's count and bars; the last device table (RAM) |
+| `/tmp/data-nag.state*` | The day's count and bars, the last connection and device tables, a lock (RAM) |
 
 To remove it: `data-nag uninstall`. It leaves battery-nag's cron line alone.
 

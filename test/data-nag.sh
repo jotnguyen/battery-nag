@@ -130,38 +130,81 @@ run 230 700 >/dev/null
 bars="$(sed -n "s/^hist='\(.*\)'$/\1/p" "${DATA_NAG_STATE}" | wc -w | tr -d ' ')"
 expect "after a long gap only 18 bars (3 h) are kept" [ "${bars}" = 18 ]
 
-echo "== the device using the most right now, and what kind of traffic"
-rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}.dev"
+echo "== the device that moved the most cellular bytes, and what kind of traffic"
+rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
 L=192.168.8 # LAN. Addresses are built from parts, so the hygiene gate sees no literal IP.
 W=203.0.113 # documentation range, standing in for the internet
-printf '1 aa:00:00:00:00:01 %s.115 laptop *\n1 aa:00:00:00:00:02 %s.203 * *\n' "${L}" "${L}" >"${DATA_NAG_LEASES}"
-# flow <proto> <state> <LAN host> <port> <reply dst host> <MB>: one connection-table line.
+printf '1 aa:00:00:00:00:01 %s.50 laptop *\n1 aa:00:00:00:00:02 %s.60 * *\n' "${L}" "${L}" >"${DATA_NAG_LEASES}"
+# flow <proto> <state> <LAN host> <port> <reply host> <MB> [source port]: one
+# connection-table line. The reply host .1 is the cellular address, .2 another uplink.
 flow() {
   printf 'ipv4 2 %s %s src=%s.%s dst=%s.9 sport=%s dport=%s packets=1 bytes=1000000 src=%s.9 dst=%s.%s sport=%s dport=%s packets=1 bytes=%s [ASSURED] mark=0 zone=0 use=2\n' \
-    "$1" "$2" "${L}" "$3" "${W}" "$4" "$4" "${W}" "${W}" "$5" "$4" "$4" "$((($6 - 1) * 1000000))"
+    "$1" "$2" "${L}" "$3" "${W}" "${7:-$4}" "$4" "${W}" "${W}" "$5" "$4" "${7:-$4}" "$((($6 - 1) * 1000000))"
 }
 # ct <laptop MB> <tablet MB>: the laptop's Tailscale flow, the tablet's HTTPS flow,
 # and a big flow from a third device that left over another uplink.
 ct() {
-  flow udp '17 120' 115 41641 1 "$1"
-  flow tcp '6 300 ESTABLISHED' 203 443 1 "$2"
+  flow udp '17 120' 50 41641 1 "$1"
+  flow tcp '6 300 ESTABLISHED' 60 443 1 "$2"
   flow tcp '6 300 ESTABLISHED' 150 443 2 900
 }
 export DATA_NAG_CELL_IP="${W}.1"
-ct 100 50 >"${DATA_NAG_CONNTRACK}"
 run 0 0 >/dev/null
+ct 100 50 >"${DATA_NAG_CONNTRACK}"
+msg="$(run 2 100)"
+expect "first active check only records the table" [ ! -s "${DATA_NAG_STATE}.dev" ]
 ct 400 60 >"${DATA_NAG_CONNTRACK}"
-msg="$(run 2 300)"
+msg="$(run 4 400)"
 expect "laptop named, its rate and Tailscale" has "${msg}" "Top now: laptop, 20 Mbit/s, Tailscale tunnel"
 ct 400 360 >"${DATA_NAG_CONNTRACK}"
-msg="$(run 4 600)"
-expect "no name in the lease: its address; HTTPS" has "${msg}" "Top now: ${L}.203, 20 Mbit/s, HTTPS"
+msg="$(run 6 700)"
+expect "no name in the lease: its address; HTTPS" has "${msg}" "Top now: ${L}.60, 20 Mbit/s, HTTPS"
 expect "a flow over another uplink is not counted" sh -c "! grep -q '[.]150 ' '${DATA_NAG_STATE}.dev'"
+# Both old flows close; the tablet opens a new connection that moves 200 MB.
+flow tcp '6 300 ESTABLISHED' 60 443 1 200 50002 >"${DATA_NAG_CONNTRACK}"
+msg="$(run 8 1000)"
+expect "a new connection counts in full, a closed one is not negative" has "${msg}" "Top now: ${L}.60, 13 Mbit/s, HTTPS"
+run 10 1000 >/dev/null
+expect "cellular idle: the table is dropped" [ ! -e "${DATA_NAG_STATE}.flows" ]
 unset DATA_NAG_CELL_IP
+ct 1400 50 >"${DATA_NAG_CONNTRACK}"
+run 12 1100 >/dev/null
+msg="$(run 14 1300)"
+expect "no cellular address: no device named" sh -c "! printf '%s' '${msg}' | grep -q 'Top now'"
 rm -f "${DATA_NAG_CONNTRACK}" "${DATA_NAG_LEASES}"
 
+echo "== one check at a time"
+rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
+printf 'DEVICE_NAME=Puli\n' >"${DATA_NAG_CONF}"
+run 0 0 >/dev/null
+sleep 30 &
+live=$!
+mkdir "${DATA_NAG_STATE}.lock" && echo "${live}" >"${DATA_NAG_STATE}.lock/pid"
+step 2 300 - "a running check holds the lock: skipped"
+kill "${live}" 2>/dev/null
+wait "${live}" 2>/dev/null
+step 4 300 "p0 Puli cellular 300 MB" "the lock of a check that died is taken over"
+expect "the lock is released" [ ! -d "${DATA_NAG_STATE}.lock" ]
+
+echo "== eiotclub: the provider's balance, by the ICCID in the network config"
+json='{"code":10000,"data":{"iccid":"@ICCID@","remain_str":"5.1 GB","total_str":"25 GB"}}'
+two="network.modem_a=interface
+network.modem_a.iccid='1234'
+network.modem_a.disabled='1'
+network.modem_b=interface
+network.modem_b.iccid='5678'"
+got="$(DATA_NAG_UCI_NETWORK="${two}" DATA_NAG_EIOTCLUB_JSON="${json}" ${SH} openwrt/data-nag eiotclub)"
+expect "balance parsed" [ "${got}" = "eSIM left: 5.1 GB of 25 GB (EIOTCLUB's count, hours behind)" ]
+got="$(DATA_NAG_UCI_NETWORK="${two}" DATA_NAG_EIOTCLUB_JSON='{"data":{"remain_str":"@ICCID@"}}' ${SH} openwrt/data-nag eiotclub)"
+expect "dual-SIM: the enabled modem's ICCID" has "${got}" "eSIM left: 5678 of"
+got="$(DATA_NAG_UCI_NETWORK="network.modem_a.iccid='1234'
+network.modem_a.disabled='1'" DATA_NAG_EIOTCLUB_JSON='{"data":{"remain_str":"@ICCID@"}}' ${SH} openwrt/data-nag eiotclub)"
+expect "only a disabled modem: its ICCID anyway" has "${got}" "eSIM left: 1234 of"
+expect "no ICCID: fails" sh -c "! DATA_NAG_UCI_NETWORK='network.lan.proto=static' DATA_NAG_EIOTCLUB_JSON='{}' ${SH} openwrt/data-nag eiotclub 2>/dev/null"
+expect "no balance in the answer: fails" sh -c "! DATA_NAG_UCI_NETWORK=\"network.m.iccid='1'\" DATA_NAG_EIOTCLUB_JSON='{\"code\":10002}' ${SH} openwrt/data-nag eiotclub 2>/dev/null"
+
 echo "== BALANCE_CMD adds a line, e.g. the provider's count"
-rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}.dev"
+rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
 printf 'DEVICE_NAME=Puli\nBALANCE_CMD="echo eSIM left: 5.1 GB of 25 GB"\n' >"${DATA_NAG_CONF}"
 run 0 0 >/dev/null
 msg="$(run 2 300)"
