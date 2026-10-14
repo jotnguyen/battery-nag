@@ -356,7 +356,9 @@ status() {
   [ ! -s "${STATE}.dev" ] || echo "devices:  $(sort -k2,2nr "${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (live connections)"
   line="$(balance)"
   [ -z "${line}" ] || echo "balance:  ${line}"
-  echo "alerts:   every ${STEP_MB} MB (pushed: $((pushed * STEP_MB)) MB), urgent ${URGENT_MB:+from ${URGENT_MB} MB}${URGENT_MB:-never}"
+  urgent=never
+  [ -z "${URGENT_MB}" ] || urgent="from ${URGENT_MB} MB"
+  echo "alerts:   every ${STEP_MB} MB (pushed: $((pushed * STEP_MB)) MB), urgent ${urgent}"
   if [ -n "${checked}" ]; then
     echo "checked:  $(($(now) - checked))s ago (cron runs it every 2 minutes)"
   else
