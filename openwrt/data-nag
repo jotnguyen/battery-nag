@@ -1,0 +1,338 @@
+#!/bin/sh
+# data-nag: push a phone alert when a GL.iNet router has used a set amount of
+# cellular data, so a video left streaming over a metered SIM is caught after
+# 500 MB instead of after 9 GB.
+#
+# It counts the bytes on the modem's network device (wwan0 on GL.iNet routers with
+# a built-in Quectel modem) from the kernel's counters: no AT commands, no web
+# login, no change to GL.iNet files. Tested on a GL-XE300 (Puli), firmware 4.8.4.
+# Pushes go out through Pushover, with the same keys as battery-nag.
+#
+# Usage (on the router, as root):
+#   sh data-nag install   # copy itself to /usr/bin, add the config and a cron line
+#   data-nag setup        # ask for the Pushover keys, save them, send a test push
+#   data-nag status       # cellular data used since the daily reset, rate, alerts
+#   data-nag test         # send a test push
+#   data-nag check        # what cron runs every 2 minutes
+#   data-nag reset        # start counting from zero again (until the next reset)
+#   data-nag uninstall    # remove everything install added
+#
+# Config: /etc/data-nag.conf (shell variables). If it has no Pushover keys, the
+#         ones in /etc/battery-nag.conf are used.
+# State:  /tmp/data-nag.state (RAM, so a reboot starts the count again; the modem's
+#         counter starts again at a reboot too).
+# Tests:  DATA_NAG_BYTES="<total bytes>" stands in for the counter, DATA_NAG_NOW
+#         for the clock, DATA_NAG_WIFI=0|1 for the Wi-Fi uplink, and DRY_RUN=1
+#         prints pushes instead of sending them (see test/data-nag.sh).
+set -u
+
+CONF="${DATA_NAG_CONF:-/etc/data-nag.conf}"
+BATTERY_CONF="${DATA_NAG_BATTERY_CONF:-/etc/battery-nag.conf}"
+STATE="${DATA_NAG_STATE:-/tmp/data-nag.state}"
+BIN=/usr/bin/data-nag
+CRONTAB=/etc/crontabs/root
+CRON_LINE="*/2 * * * * ${BIN} check >/dev/null 2>&1"
+
+# Defaults; battery-nag's config, then this one, override them.
+PUSHOVER_USER=
+PUSHOVER_TOKEN=
+PUSHOVER_URL=https://api.pushover.net/1/messages.json
+DEVICE_NAME=Router
+CELL_DEV=wwan0
+WIFI_IFACE=wwan
+STEP_MB=500
+URGENT_MB=2000
+RESET_HOUR=12
+# shellcheck source=/dev/null
+[ -r "${BATTERY_CONF}" ] && . "${BATTERY_CONF}"
+# shellcheck source=/dev/null
+[ -r "${CONF}" ] && . "${CONF}"
+DRY_RUN="${DRY_RUN:-0}"
+MB=1000000
+
+log() {
+  logger -t data-nag "$*" 2>/dev/null || true
+  echo "data-nag: $*" >&2
+}
+
+configured() { [ -n "${PUSHOVER_USER}" ] && [ -n "${PUSHOVER_TOKEN}" ]; }
+
+now() { echo "${DATA_NAG_NOW:-$(date +%s)}"; }
+
+# read_bytes: set bytes to the modem device's received plus sent bytes. Fails when
+# the device does not exist (no modem, or the modem is being reset).
+read_bytes() {
+  if [ -n "${DATA_NAG_BYTES:-}" ]; then
+    bytes="${DATA_NAG_BYTES}"
+  else
+    dir="/sys/class/net/${CELL_DEV}/statistics"
+    [ -r "${dir}/rx_bytes" ] || return 1
+    bytes=$(($(cat "${dir}/rx_bytes") + $(cat "${dir}/tx_bytes")))
+  fi
+  case "${bytes}" in '' | *[!0-9]*) return 1 ;; esac
+}
+
+# wifi_up: true when the Wi-Fi uplink (GL.iNet's repeater, interface "wwan") is up.
+wifi_up() {
+  if [ -n "${DATA_NAG_WIFI:-}" ]; then
+    [ "${DATA_NAG_WIFI}" = 1 ]
+  else
+    [ "$(ubus call "network.interface.${WIFI_IFACE}" status 2>/dev/null | jsonfilter -e '@.up')" = true ]
+  fi
+}
+
+# period <epoch>: the day the count belongs to. The day starts at RESET_HOUR local
+# time, not midnight, so a night of streaming is counted as one night.
+period() { date -d "@$(($1 - RESET_HOUR * 3600))" +%Y%m%d; }
+
+# mb <bytes>: "740 MB" under 1 GB, "1.4 GB" from there.
+mb() {
+  if [ "$1" -lt $((1000 * MB)) ]; then
+    echo "$(($1 / MB)) MB"
+  else
+    echo "$(($1 / (1000 * MB))).$(($1 % (1000 * MB) / (100 * MB))) GB"
+  fi
+}
+
+# push <priority> <title> <message>. Pushover priority 0 is a normal push; 1 also
+# sounds during quiet hours, which is when a forgotten stream runs.
+push() {
+  if [ "${DRY_RUN}" = 1 ]; then
+    echo "DRY RUN push p$1: $2: $3"
+    return 0
+  fi
+  if curl -fsS --max-time 20 "${PUSHOVER_URL}" \
+    --form-string "token=${PUSHOVER_TOKEN}" --form-string "user=${PUSHOVER_USER}" \
+    --form-string "priority=$1" --form-string "title=$2" --form-string "message=$3" >/dev/null; then
+    log "pushed: $2"
+  else
+    log "push failed (no uplink, or wrong keys); will retry next run: $2"
+    return 1
+  fi
+}
+
+load_state() {
+  day=
+  used=0
+  last=
+  pushed=0
+  checked=
+  rate=0
+  # shellcheck source=/dev/null
+  [ -r "${STATE}" ] && . "${STATE}"
+}
+
+save_state() {
+  printf 'day=%s\nused=%s\nlast=%s\npushed=%s\nchecked=%s\nrate=%s\n' \
+    "${day}" "${used}" "${last}" "${pushed}" "${checked}" "${rate}" >"${STATE}"
+}
+
+# check: add the bytes since the last run to the day's count, push when it crosses
+# the next STEP_MB, and record the state.
+check() {
+  t="$(now)"
+  load_state
+  if ! read_bytes; then
+    # No modem device: nothing to count. Keep the state so the next reading adds on.
+    checked="${t}"
+    rate=0
+    save_state
+    return 0
+  fi
+  today="$(period "${t}")"
+  if [ "${day}" != "${today}" ]; then
+    day="${today}"
+    used=0
+    pushed=0
+  fi
+  if [ -z "${last}" ]; then
+    # First run (install, or after a reboot cleared /tmp): start from here.
+    delta=0
+  elif [ "${bytes}" -ge "${last}" ]; then
+    delta=$((bytes - last))
+  else
+    # The counter went back: the modem device was recreated. Count what it has.
+    delta="${bytes}"
+  fi
+  used=$((used + delta))
+  rate=0
+  if [ -n "${checked}" ] && [ "${t}" -gt "${checked}" ]; then
+    rate=$((delta * 8 / (t - checked) / 1000))
+  fi
+  last="${bytes}"
+  checked="${t}"
+  if [ "${DRY_RUN}" = 1 ] || configured; then alert; fi
+  save_state
+}
+
+# alert: one push per STEP_MB crossed (500 MB, 1 GB, 1.5 GB, ...). A jump past
+# several steps pushes once. From URGENT_MB on, pushes are urgent.
+alert() {
+  step=$((used / (STEP_MB * MB)))
+  [ "${step}" -gt "${pushed}" ] || return 0
+  priority=0
+  [ -n "${URGENT_MB}" ] && [ "${used}" -ge $((URGENT_MB * MB)) ] && priority=1
+  msg="$(mb "${used}") of cellular data since ${RESET_HOUR}:00."
+  if [ "${rate}" -ge 1000 ]; then
+    msg="${msg} Now $((rate / 1000)) Mbit/s: something is streaming or downloading."
+  fi
+  if wifi_up; then
+    msg="${msg} Wi-Fi uplink is up."
+  else
+    msg="${msg} Wi-Fi uplink is off: all traffic is on the SIM."
+  fi
+  push "${priority}" "${DEVICE_NAME} cellular $(mb "${used}")" "${msg}" && pushed="${step}"
+}
+
+status() {
+  load_state
+  if read_bytes; then
+    echo "modem:    ${CELL_DEV}, $(mb "${bytes}") since it came up"
+  else
+    echo "modem:    no ${CELL_DEV} device (no modem, or it is being reset)"
+  fi
+  if wifi_up; then echo "wifi:     uplink up"; else echo "wifi:     uplink off"; fi
+  if [ -n "${day}" ]; then
+    echo "used:     $(mb "${used}") on cellular since ${RESET_HOUR}:00 (day ${day})"
+    echo "rate:     ${rate} kbit/s at the last check"
+  fi
+  echo "alerts:   every ${STEP_MB} MB (pushed: $((pushed * STEP_MB)) MB), urgent from ${URGENT_MB:-never} MB"
+  if [ -n "${checked}" ]; then
+    echo "checked:  $(($(now) - checked))s ago (cron runs it every 2 minutes)"
+  else
+    echo "checked:  not yet (cron runs it every 2 minutes)"
+  fi
+  if configured; then
+    echo "pushover: keys set"
+  else
+    echo "pushover: keys MISSING, run: data-nag setup"
+  fi
+}
+
+reset() {
+  load_state
+  used=0
+  pushed=0
+  save_state
+  echo "count reset to 0 (until ${RESET_HOUR}:00 starts a new day)"
+}
+
+test_push() {
+  configured || { echo "no Pushover keys in ${CONF} or ${BATTERY_CONF}; run: data-nag setup" >&2; return 1; }
+  push 0 "${DEVICE_NAME} data-nag test" "Alerts work. You'll hear at every ${STEP_MB} MB of cellular data." \
+    && echo "test push sent"
+}
+
+setup() {
+  [ -w "${CONF}" ] || { echo "cannot write ${CONF}; run install first" >&2; return 1; }
+  printf 'Pushover user key (top of the pushover.net dashboard): '
+  read -r user
+  printf 'Pushover API token (an app for this router, pushover.net/apps/build): '
+  read -r token
+  for key in "${user}" "${token}"; do
+    case "${key}" in
+      '' | *[!A-Za-z0-9]*)
+        echo "Pushover keys are letters and digits only; nothing saved" >&2
+        return 1
+        ;;
+    esac
+  done
+  sed -i -e "s/^#* *PUSHOVER_USER=.*/PUSHOVER_USER=${user}/" \
+    -e "s/^#* *PUSHOVER_TOKEN=.*/PUSHOVER_TOKEN=${token}/" "${CONF}"
+  chmod 600 "${CONF}"
+  # shellcheck source=/dev/null
+  . "${CONF}"
+  if [ "${PUSHOVER_USER}" != "${user}" ] || [ "${PUSHOVER_TOKEN}" != "${token}" ]; then
+    echo "could not save the keys: ${CONF} needs PUSHOVER_USER= and PUSHOVER_TOKEN= lines" >&2
+    return 1
+  fi
+  echo "saved to ${CONF}"
+  test_push
+}
+
+write_conf() {
+  cat >"${CONF}" <<'EOF'
+# data-nag config, sourced as shell by /usr/bin/data-nag.
+# If battery-nag is installed, its Pushover keys and DEVICE_NAME are used, so
+# the key lines stay commented out. Otherwise fill them with `data-nag setup`.
+#PUSHOVER_USER=
+#PUSHOVER_TOKEN=
+#DEVICE_NAME=Router
+
+# Push once at every STEP_MB megabytes of cellular data (sent plus received) in
+# a day: 500 MB, 1 GB, 1.5 GB, ...
+STEP_MB=500
+
+# From this many megabytes on, each push is urgent (Pushover priority 1: it
+# sounds during quiet hours too). Empty: never urgent.
+URGENT_MB=2000
+
+# The hour (0-23, local time) the day's count goes back to zero. Noon, so a
+# night of streaming is one count instead of two halves split at midnight.
+RESET_HOUR=12
+
+# The modem's network device, and GL.iNet's name for the Wi-Fi uplink
+# (repeater) interface, which the push mentions.
+CELL_DEV=wwan0
+WIFI_IFACE=wwan
+EOF
+}
+
+# append_line <file> <line>: add the line unless it is there, after a final newline.
+append_line() {
+  grep -qxF "$2" "$1" 2>/dev/null && return 0
+  [ ! -s "$1" ] || [ -z "$(tail -c 1 "$1")" ] || echo >>"$1"
+  echo "$2" >>"$1"
+}
+
+install() {
+  [ -d "/sys/class/net/${CELL_DEV}" ] \
+    || echo "install: no ${CELL_DEV} device right now; set CELL_DEV in ${CONF} if your modem uses another" >&2
+  command -v curl >/dev/null || { echo "install: needs curl (opkg install curl)" >&2; return 1; }
+
+  cp "$0" "${BIN}.new" && chmod 755 "${BIN}.new" && mv "${BIN}.new" "${BIN}" || return 1
+  [ -f "${CONF}" ] || write_conf
+  chmod 600 "${CONF}"
+
+  # The stock OpenWrt cron service runs crond on /etc/crontabs; GL.iNet's own
+  # crond on /tmp/gl_crontabs is left alone.
+  sed -i '/data-nag check/d' "${CRONTAB}" 2>/dev/null
+  append_line "${CRONTAB}" "${CRON_LINE}"
+  /etc/init.d/cron enable
+  /etc/init.d/cron restart
+
+  append_line /etc/sysupgrade.conf "${BIN}"
+  append_line /etc/sysupgrade.conf "${CONF}"
+
+  # Start counting from now, not from the bytes used since boot.
+  rm -f "${STATE}"
+  check
+  echo "data-nag installed."
+  status
+}
+
+uninstall() {
+  if [ -f "${CRONTAB}" ]; then
+    sed -i '/data-nag/d' "${CRONTAB}"
+    # An empty /etc/crontabs leaves the stock cron service idle, as shipped.
+    [ -s "${CRONTAB}" ] || rm -f "${CRONTAB}"
+  fi
+  /etc/init.d/cron restart 2>/dev/null
+  sed -i -e "\\#^${BIN}\$#d" -e "\\#^${CONF}\$#d" /etc/sysupgrade.conf
+  rm -f "${BIN}" "${CONF}" "${STATE}"
+  echo "data-nag removed."
+}
+
+case "${1:-}" in
+  check) check ;;
+  status) status ;;
+  setup) setup ;;
+  test) test_push ;;
+  reset) reset ;;
+  install) install ;;
+  uninstall) uninstall ;;
+  *)
+    echo "usage: data-nag install|setup|status|test|check|reset|uninstall" >&2
+    exit 2
+    ;;
+esac

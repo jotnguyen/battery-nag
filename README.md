@@ -13,6 +13,10 @@ Tested on a GL-XE300 (Puli), firmware 4.8.4 (OpenWrt 22.03). Other GL.iNet 4.x
 routers with a battery should work if `ubus call mcu status` prints a
 `charge_percent`.
 
+Its sibling, [data-nag](docs/data-nag.md), warns about cellular data instead: a
+push at every 500 MB used over the SIM in a day, urgent from 2 GB, so a video
+left streaming overnight after the Wi-Fi uplink dropped is caught early.
+
 ## What it sends
 
 | When | Push |
@@ -96,9 +100,10 @@ logread -e battery-nag      # pushes sent and failed
 
 ## Develop
 
-`openwrt/battery-nag` runs on BusyBox ash, so it is POSIX sh only.
-`sh test/run.sh` runs the scenarios with a faked battery reading and prints the
-pushes instead of sending them. CI runs the scenarios under dash and BusyBox ash,
+`openwrt/battery-nag` and `openwrt/data-nag` run on BusyBox ash, so they are
+POSIX sh only. `sh test/run.sh` and `sh test/data-nag.sh` run the scenarios with
+a faked battery reading or byte counter and print the pushes instead of sending
+them. CI runs the scenarios under dash and BusyBox ash,
 plus shellcheck and `scripts/hygiene.sh`, which keeps personal data out of this
 public repo. [docs/PLAN.md](docs/PLAN.md) has the design decisions and what's left.
 
