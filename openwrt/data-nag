@@ -173,7 +173,7 @@ spark() {
   echo "${hist}" | awk -v mb="${MB}" 'BEGIN { split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", c, " ") } NF >= 2 {
     m = 0; for (i = 1; i <= NF; i++) if ($i > m) m = $i
     s = ""; for (i = 1; i <= NF; i++) s = s c[($i <= 0 || m == 0) ? 1 : 2 + int($i / m * 6.999)]
-    min = NF * 10; span = (min >= 60) ? sprintf("%g h", min / 60) : min " min"
+    min = NF * 10; span = (min % 60 == 0) ? (min / 60) " h" : min " min"
     printf "Last %s %s (10-min bars, peak %d MB)\n", span, s, m / mb }'
 }
 
