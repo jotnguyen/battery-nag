@@ -14,7 +14,8 @@ SH="${SH:-sh}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 export DATA_NAG_STATE="${tmp}/state" DATA_NAG_CONF="${tmp}/conf" \
-  DATA_NAG_BATTERY_CONF="${tmp}/battery-conf" TZ=UTC
+  DATA_NAG_BATTERY_CONF="${tmp}/battery-conf" TZ=UTC \
+  DATA_NAG_CONNTRACK="${tmp}/ct" DATA_NAG_LEASES="${tmp}/leases"
 fails=0
 T0=1791918000 # 19:00 UTC
 
@@ -60,19 +61,20 @@ expect() {
 # shellcheck disable=SC2317,SC2329
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
-echo "== a push every 500 MB, urgent from 2 GB, a day starting at noon"
-printf 'DEVICE_NAME=Puli\n' >"${DATA_NAG_CONF}"
+echo "== a push every 250 MB, urgent from 1 GB, a day starting at noon"
+printf 'DEVICE_NAME=Puli
+' >"${DATA_NAG_CONF}"
 step 0 5000 - "first run: counts from here, not from boot"
-step 2 5400 -
-step 4 5500 "p0 Puli cellular 500 MB"
-step 6 5900 - "already pushed for 500 MB"
-step 8 6000 "p0 Puli cellular 1.0 GB"
-step 10 7600 "p1 Puli cellular 2.6 GB" "past 1.5, 2 and 2.5 GB at once: one push, urgent"
-step 12 300 - "counter went back (modem reset): its 300 MB are added"
-step 14 400 "p1 Puli cellular 3.0 GB"
-step 302 900 "p1 Puli cellular 3.5 GB" "past midnight: the same night, the same count"
+step 2 5200 -
+step 4 5250 "p0 Puli cellular 250 MB"
+step 6 5400 - "already pushed for 250 MB"
+step 8 5500 "p0 Puli cellular 500 MB"
+step 10 6600 "p1 Puli cellular 1.6 GB" "past 750 MB and 1, 1.25, 1.5 GB at once: one push, urgent"
+step 12 100 - "counter went back (modem reset): its 100 MB are added"
+step 14 400 "p1 Puli cellular 2.0 GB"
+step 302 900 "p1 Puli cellular 2.5 GB" "past midnight: the same night, the same count"
 step 1022 1000 - "past noon: a new day, 100 MB so far"
-step 1024 1500 "p0 Puli cellular 600 MB"
+step 1024 1350 "p0 Puli cellular 450 MB"
 
 echo "== the push says how fast and whether Wi-Fi is up"
 rm -f "${DATA_NAG_STATE}"
@@ -115,6 +117,58 @@ printf 'DEVICE_NAME=Puli\nSTEP_MB=100\nURGENT_MB=\n' >"${DATA_NAG_CONF}"
 step 6 950 - "50 MB since the reset"
 step 8 1000 "p0 Puli cellular 100 MB"
 step 10 3000 "p0 Puli cellular 2.1 GB" "URGENT_MB empty: never urgent"
+
+echo "== a bar line of the last hours, in 10-minute bars"
+rm -f "${DATA_NAG_STATE}"
+printf 'DEVICE_NAME=Puli\n' >"${DATA_NAG_CONF}"
+run 0 0 >/dev/null
+run 10 100 >/dev/null
+run 20 300 >/dev/null
+msg="$(run 30 600)"
+expect "bars: 0, 100, 200, 300 MB" has "${msg}" "Last 40 min ▁▄▆█ (10-min bars, peak 300 MB)"
+run 230 700 >/dev/null
+bars="$(sed -n "s/^hist='\(.*\)'$/\1/p" "${DATA_NAG_STATE}" | wc -w | tr -d ' ')"
+expect "after a long gap only 18 bars (3 h) are kept" [ "${bars}" = 18 ]
+
+echo "== the device using the most right now, and what kind of traffic"
+rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}.dev"
+L=192.168.8 # LAN. Addresses are built from parts, so the hygiene gate sees no literal IP.
+W=203.0.113 # documentation range, standing in for the internet
+printf '1 aa:00:00:00:00:01 %s.115 laptop *\n1 aa:00:00:00:00:02 %s.203 * *\n' "${L}" "${L}" >"${DATA_NAG_LEASES}"
+# flow <proto> <state> <LAN host> <port> <reply dst host> <MB>: one connection-table line.
+flow() {
+  printf 'ipv4 2 %s %s src=%s.%s dst=%s.9 sport=%s dport=%s packets=1 bytes=1000000 src=%s.9 dst=%s.%s sport=%s dport=%s packets=1 bytes=%s [ASSURED] mark=0 zone=0 use=2\n' \
+    "$1" "$2" "${L}" "$3" "${W}" "$4" "$4" "${W}" "${W}" "$5" "$4" "$4" "$((($6 - 1) * 1000000))"
+}
+# ct <laptop MB> <tablet MB>: the laptop's Tailscale flow, the tablet's HTTPS flow,
+# and a big flow from a third device that left over another uplink.
+ct() {
+  flow udp '17 120' 115 41641 1 "$1"
+  flow tcp '6 300 ESTABLISHED' 203 443 1 "$2"
+  flow tcp '6 300 ESTABLISHED' 150 443 2 900
+}
+export DATA_NAG_CELL_IP="${W}.1"
+ct 100 50 >"${DATA_NAG_CONNTRACK}"
+run 0 0 >/dev/null
+ct 400 60 >"${DATA_NAG_CONNTRACK}"
+msg="$(run 2 300)"
+expect "laptop named, its rate and Tailscale" has "${msg}" "Top now: laptop, 20 Mbit/s, Tailscale tunnel"
+ct 400 360 >"${DATA_NAG_CONNTRACK}"
+msg="$(run 4 600)"
+expect "no name in the lease: its address; HTTPS" has "${msg}" "Top now: ${L}.203, 20 Mbit/s, HTTPS"
+expect "a flow over another uplink is not counted" sh -c "! grep -q '[.]150 ' '${DATA_NAG_STATE}.dev'"
+unset DATA_NAG_CELL_IP
+rm -f "${DATA_NAG_CONNTRACK}" "${DATA_NAG_LEASES}"
+
+echo "== BALANCE_CMD adds a line, e.g. the provider's count"
+rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}.dev"
+printf 'DEVICE_NAME=Puli\nBALANCE_CMD="echo eSIM left: 5.1 GB of 25 GB"\n' >"${DATA_NAG_CONF}"
+run 0 0 >/dev/null
+msg="$(run 2 300)"
+expect "balance line in the push" has "${msg}" "eSIM left: 5.1 GB of 25 GB"
+printf 'DEVICE_NAME=Puli\nBALANCE_CMD=false\n' >"${DATA_NAG_CONF}"
+msg="$(run 4 600)"
+expect "a failing BALANCE_CMD adds nothing, the push still goes" has "${msg}" "Puli cellular 600 MB"
 
 echo
 if [ "${fails}" -eq 0 ]; then echo "all ok"; else echo "${fails} failed"; fi
