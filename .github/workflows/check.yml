@@ -12,10 +12,11 @@ jobs:
       - name: Hygiene (no personal data or secrets)
         run: bash scripts/hygiene.sh
       - name: Shellcheck
-        run: shellcheck openwrt/battery-nag test/run.sh scripts/*.sh .githooks/*
+        run: shellcheck openwrt/* test/*.sh scripts/*.sh .githooks/*
       - name: Scenario tests (dash)
-        run: sh test/run.sh
+        run: sh test/run.sh && sh test/data-nag.sh
       - name: Scenario tests (BusyBox ash, the router's shell)
         run: |
           sudo apt-get install -y busybox >/dev/null
           SH="busybox sh" busybox sh test/run.sh
+          SH="busybox sh" busybox sh test/data-nag.sh

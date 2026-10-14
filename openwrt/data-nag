@@ -1,0 +1,557 @@
+#!/bin/sh
+# data-nag: push a phone alert when a GL.iNet router has used a set amount of
+# cellular data, so a video or an OS update running over a metered SIM is caught
+# after 250 MB instead of after 9 GB.
+#
+# It counts the bytes on the modem's network device (wwan0 on GL.iNet routers with
+# a built-in Quectel modem) from the kernel's counters: no AT commands, no web
+# login, no change to GL.iNet files. Tested on a GL-XE300 (Puli), firmware 4.8.4.
+# Pushes go out through Pushover, with the same keys as battery-nag.
+#
+# Each push says how much, how fast, and whether the Wi-Fi uplink is up, then adds:
+# a bar line of the last 3 hours in 10-minute steps, the device using the most
+# right now and what kind of traffic it is (from the kernel's connection table),
+# and, if BALANCE_CMD is set, what the SIM provider says is left.
+#
+# Usage (on the router, as root):
+#   sh data-nag install   # copy itself to /usr/bin, add the config and a cron line
+#   data-nag setup        # ask for the Pushover keys, save them, send a test push
+#   data-nag status       # today's count, the last 3 hours, top device, balance
+#   data-nag test         # send a test push
+#   data-nag check        # what cron runs every 2 minutes
+#   data-nag reset        # start counting from zero again (until the next reset)
+#   data-nag eiotclub     # print an EIOTCLUB eSIM's balance (for BALANCE_CMD)
+#   data-nag uninstall    # remove everything install added
+#
+# Config: /etc/data-nag.conf (shell variables). If it has no Pushover keys, the
+#         ones in /etc/battery-nag.conf are used.
+# State:  /tmp/data-nag.state, .state.flows and .state.dev (RAM, so a reboot starts
+#         the count again; the modem's counter starts again at a reboot too).
+# Tests:  DATA_NAG_BYTES="<total bytes>" stands in for the counter, DATA_NAG_NOW
+#         for the clock, DATA_NAG_WIFI=0|1 for the Wi-Fi uplink, DATA_NAG_CONNTRACK
+#         and DATA_NAG_LEASES for the connection table and DHCP leases, and
+#         DATA_NAG_UCI_NETWORK and DATA_NAG_EIOTCLUB_JSON for eiotclub, and
+#         DRY_RUN=1 prints pushes instead of sending them (see test/data-nag.sh).
+set -u
+
+CONF="${DATA_NAG_CONF:-/etc/data-nag.conf}"
+BATTERY_CONF="${DATA_NAG_BATTERY_CONF:-/etc/battery-nag.conf}"
+STATE="${DATA_NAG_STATE:-/tmp/data-nag.state}"
+CONNTRACK="${DATA_NAG_CONNTRACK:-/proc/net/nf_conntrack}"
+LEASES="${DATA_NAG_LEASES:-/tmp/dhcp.leases}"
+BIN=/usr/bin/data-nag
+CRONTAB=/etc/crontabs/root
+CRON_LINE="*/2 * * * * ${BIN} check >/dev/null 2>&1"
+
+# Defaults; battery-nag's config, then this one, override them.
+PUSHOVER_USER=
+PUSHOVER_TOKEN=
+PUSHOVER_URL=https://api.pushover.net/1/messages.json
+DEVICE_NAME=Router
+CELL_DEV=wwan0
+WIFI_IFACE=wwan
+STEP_MB=250
+URGENT_MB=1000
+RESET_HOUR=12
+LAN_PREFIX=
+BALANCE_CMD=
+ICCID=
+EIOTCLUB_URL=https://sim.eiotclub.com/eshop/api/get/card
+# shellcheck source=/dev/null
+[ -r "${BATTERY_CONF}" ] && . "${BATTERY_CONF}"
+# shellcheck source=/dev/null
+[ -r "${CONF}" ] && . "${CONF}"
+DRY_RUN="${DRY_RUN:-0}"
+MB=1000000
+BUCKET=600   # seconds per bar in the history line
+BUCKETS=18   # bars kept: 3 hours
+
+log() {
+  logger -t data-nag "$*" 2>/dev/null || true
+  echo "data-nag: $*" >&2
+}
+
+configured() { [ -n "${PUSHOVER_USER}" ] && [ -n "${PUSHOVER_TOKEN}" ]; }
+
+now() { echo "${DATA_NAG_NOW:-$(date +%s)}"; }
+
+# read_bytes: set bytes to the modem device's received plus sent bytes. Fails when
+# the device does not exist (no modem, or the modem is being reset).
+read_bytes() {
+  if [ -n "${DATA_NAG_BYTES:-}" ]; then
+    bytes="${DATA_NAG_BYTES}"
+  else
+    dir="/sys/class/net/${CELL_DEV}/statistics"
+    [ -r "${dir}/rx_bytes" ] || return 1
+    bytes=$(($(cat "${dir}/rx_bytes") + $(cat "${dir}/tx_bytes")))
+  fi
+  case "${bytes}" in '' | *[!0-9]*) return 1 ;; esac
+}
+
+# wifi_up: true when the Wi-Fi uplink (GL.iNet's repeater, interface "wwan") is up.
+wifi_up() {
+  if [ -n "${DATA_NAG_WIFI:-}" ]; then
+    [ "${DATA_NAG_WIFI}" = 1 ]
+  else
+    [ "$(ubus call "network.interface.${WIFI_IFACE}" status 2>/dev/null | jsonfilter -e '@.up')" = true ]
+  fi
+}
+
+# period <epoch>: the day the count belongs to. The day starts at RESET_HOUR local
+# time, not midnight, so a night of streaming is counted as one night.
+period() { date -d "@$(($1 - RESET_HOUR * 3600))" +%Y%m%d; }
+
+# mb <bytes>: "740 MB" under 1 GB, "1.4 GB" from there.
+mb() {
+  if [ "$1" -lt $((1000 * MB)) ]; then
+    echo "$(($1 / MB)) MB"
+  else
+    echo "$(($1 / (1000 * MB))).$(($1 % (1000 * MB) / (100 * MB))) GB"
+  fi
+}
+
+# rate <kbit/s>: "15 Mbit/s" from 1 Mbit/s, "300 kbit/s" under.
+rate_str() {
+  if [ "$1" -ge 1000 ]; then echo "$(($1 / 1000)) Mbit/s"; else echo "$1 kbit/s"; fi
+}
+
+# push <priority> <title> <message>. Pushover priority 0 is a normal push; 1 also
+# sounds during quiet hours, which is when a forgotten stream runs.
+push() {
+  if [ "${DRY_RUN}" = 1 ]; then
+    echo "DRY RUN push p$1: $2: $3"
+    return 0
+  fi
+  if curl -fsS --max-time 20 "${PUSHOVER_URL}" \
+    --form-string "token=${PUSHOVER_TOKEN}" --form-string "user=${PUSHOVER_USER}" \
+    --form-string "priority=$1" --form-string "title=$2" --form-string "message=$3" >/dev/null; then
+    log "pushed: $2"
+  else
+    log "push failed (no uplink, or wrong keys); will retry next run: $2"
+    return 1
+  fi
+}
+
+load_state() {
+  day=
+  used=0
+  last=
+  pushed=0
+  checked=
+  rate=0
+  hist=
+  bkt=
+  # shellcheck source=/dev/null
+  [ -r "${STATE}" ] && . "${STATE}"
+}
+
+save_state() {
+  printf "day=%s\nused=%s\nlast=%s\npushed=%s\nchecked=%s\nrate=%s\nhist='%s'\nbkt=%s\n" \
+    "${day}" "${used}" "${last}" "${pushed}" "${checked}" "${rate}" "${hist}" "${bkt}" >"${STATE}"
+}
+
+# add_hist <epoch> <bytes>: add the bytes to the current 10-minute bar, starting
+# new (empty) bars for the time that has passed, and keep the last BUCKETS.
+add_hist() {
+  b=$(($1 / BUCKET))
+  if [ -z "${hist}" ] || [ -z "${bkt}" ] || [ "${b}" -lt "${bkt}" ]; then
+    hist=0
+    bkt="${b}"
+  fi
+  hist="$(echo "${hist}" | awk -v n=$((b - bkt)) -v d="$2" -v keep="${BUCKETS}" '{
+    m = NF; for (i = 1; i <= NF; i++) a[i] = $i
+    for (j = 0; j < n && j < keep; j++) a[++m] = 0
+    a[m] += d
+    out = ""; sep = ""
+    for (i = (m > keep ? m - keep + 1 : 1); i <= m; i++) { out = out sep sprintf("%.0f", a[i]); sep = " " }
+    print out }')"
+  bkt="${b}"
+}
+
+# spark: the history as a bar line, e.g. "Last 3 h ▁▁▂▅█▇ (10-min bars, peak 180 MB)".
+spark() {
+  echo "${hist}" | awk -v mb="${MB}" 'BEGIN { split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", c, " ") } NF >= 2 {
+    m = 0; for (i = 1; i <= NF; i++) if ($i > m) m = $i
+    s = ""; for (i = 1; i <= NF; i++) s = s c[($i <= 0 || m == 0) ? 1 : 2 + int($i / m * 6.999)]
+    min = NF * 10; span = (min % 60 == 0) ? (min / 60) " h" : min " min"
+    printf "Last %s %s (10-min bars, peak %d MB)\n", span, s, m / mb }'
+}
+
+lan_prefix() {
+  if [ -n "${LAN_PREFIX}" ]; then
+    echo "${LAN_PREFIX}"
+  else
+    ip="$(uci -q get network.lan.ipaddr 2>/dev/null)"
+    echo "${ip:-192.168.8.1}" | sed 's/[0-9]*$//'
+  fi
+}
+
+# cell_ip: the cellular interface's IPv4 address, so only flows that leave over
+# the SIM count. Empty when unknown, and then no device is named.
+cell_ip() {
+  if [ -n "${DATA_NAG_BYTES:-}" ]; then
+    echo "${DATA_NAG_CELL_IP:-}"
+  else
+    ip -4 addr show dev "${CELL_DEV}" 2>/dev/null | awk '$1 == "inet" { sub("/.*", "", $2); print $2; exit }'
+  fi
+}
+
+# devices: one line per LAN device, "<address> <bytes since last check> <kind>",
+# for connections that leave over the cellular address. Bytes are counted per
+# connection against the last check's table (${STATE}.flows), so connections that
+# open and close between checks still count, and a closed one can't make a
+# device's total go backwards. The kind is the one with the most of those bytes,
+# guessed from protocol and port. Prints nothing on the first check, which only
+# records the table.
+devices() {
+  wan="$(cell_ip)"
+  { [ -r "${CONNTRACK}" ] && [ -n "${wan}" ]; } || { rm -f "${STATE}.flows"; return 0; }
+  first=0
+  [ -r "${STATE}.flows" ] || { first=1; : >"${STATE}.flows"; }
+  : >"${STATE}.flows.new"
+  awk -v pre="$(lan_prefix)" -v wan="${wan}" -v pf="${STATE}.flows" -v out="${STATE}.flows.new" -v first="${first}" '
+  FILENAME == pf { p[$1] = $2; next }
+  {
+    src = ""; dst = ""; dst2 = ""; sport = ""; dport = ""; b = 0; nd = 0; proto = $3
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /^src=/) { if (src == "") src = substr($i, 5) }
+      else if ($i ~ /^dst=/) { if (++nd == 1) dst = substr($i, 5); else if (nd == 2) dst2 = substr($i, 5) }
+      else if ($i ~ /^sport=/) { if (sport == "") sport = substr($i, 7) }
+      else if ($i ~ /^dport=/) { if (dport == "") dport = substr($i, 7) }
+      else if ($i ~ /^bytes=/) b += substr($i, 7)
+    }
+    if (index(src, pre) != 1 || dst2 != wan) next
+    key = proto "/" src ":" sport ">" dst ":" dport
+    printf "%s %.0f\n", key, b > out
+    d = (key in p && b >= p[key]) ? b - p[key] : b
+    if (proto == "udp" && (sport == "41641" || dport == "41641" || dport == "3478")) k = "Tailscale tunnel"
+    else if (proto == "udp" && dport == "443") k = "QUIC (YouTube, Google)"
+    else if (proto == "tcp" && dport == "443") k = "HTTPS"
+    else if (proto == "tcp" && dport == "80") k = "HTTP (often OS updates)"
+    else if (dport == "53") k = "DNS"
+    else if (proto == "udp" && dport == "51820") k = "WireGuard VPN"
+    else k = "other"
+    tot[src] += d; per[src SUBSEP k] += d; kinds[k] = 1
+  } END {
+    if (first) exit
+    for (s in tot) {
+      if (tot[s] <= 0) continue
+      best = ""; bb = -1
+      for (k in kinds) if (per[s SUBSEP k] > bb) { bb = per[s SUBSEP k]; best = k }
+      printf "%s %.0f %s\n", s, tot[s], best
+    } }' "${STATE}.flows" "${CONNTRACK}"
+  mv "${STATE}.flows.new" "${STATE}.flows"
+}
+
+# top_device <seconds since last check>: set top to "laptop, 15 Mbit/s, HTTPS",
+# the device that moved the most cellular bytes since the last check, named from
+# the DHCP leases. Keeps the per-device table in ${STATE}.dev for status.
+top_device() {
+  devices >"${STATE}.dev"
+  top="$(sort -k2,2nr "${STATE}.dev" | head -n 1 | awk -v el="$1" -v leases="${LEASES}" '
+    BEGIN { while ((getline l < leases) > 0) { split(l, f, " "); if (f[4] != "*") name[f[3]] = f[4] } }
+    { n = ($1 in name) ? name[$1] : $1
+      k = $3; for (i = 4; i <= NF; i++) k = k " " $i
+      if (el > 0) { r = $2 * 8 / el / 1000; rs = (r >= 1000) ? sprintf("%d Mbit/s", r / 1000) : sprintf("%d kbit/s", r); print n ", " rs ", " k }
+      else print n ", " k }')"
+}
+
+# balance: the first line BALANCE_CMD prints, e.g. what the SIM provider says is
+# left. Empty when BALANCE_CMD is unset or fails. Capped at 30 seconds where the
+# firmware has `timeout`, so a hung command can't hold up the push.
+balance() {
+  [ -n "${BALANCE_CMD}" ] || return 0
+  if timeout 1 true 2>/dev/null; then
+    timeout 30 sh -c "${BALANCE_CMD}" 2>/dev/null | head -n 1
+  else
+    eval "${BALANCE_CMD}" 2>/dev/null | head -n 1
+  fi
+}
+
+# network_iccid: the ICCID of the modem interface in /etc/config/network, the
+# enabled one if there are several (dual-SIM), else the first.
+network_iccid() {
+  { if [ -n "${DATA_NAG_UCI_NETWORK:-}" ]; then printf '%s\n' "${DATA_NAG_UCI_NETWORK}"; else uci -q show network 2>/dev/null; fi; } \
+    | awk -F'[.=]' '
+      $3 == "iccid" { v = $4; gsub(/[^0-9]/, "", v); ic[$2] = v; order[++n] = $2 }
+      $3 == "disabled" { dis[$2] = $4 }
+      END { for (i = 1; i <= n; i++) if (dis[order[i]] !~ /1/) { print ic[order[i]]; exit }
+            if (n) print ic[order[1]] }'
+}
+
+# eiotclub: print an EIOTCLUB eSIM's balance from the provider's own shop page API,
+# which answers by ICCID alone. The ICCID comes from ICCID= in the config, or from
+# the modem interface in /etc/config/network.
+eiotclub() {
+  iccid="${ICCID:-$(network_iccid)}"
+  [ -n "${iccid}" ] || { echo "eiotclub: no ICCID; set ICCID= in ${CONF}" >&2; return 1; }
+  if [ -n "${DATA_NAG_EIOTCLUB_JSON:-}" ]; then
+    json="$(printf '%s' "${DATA_NAG_EIOTCLUB_JSON}" | sed "s/@ICCID@/${iccid}/g")"
+  else
+    json="$(curl -fsS --max-time 15 -X POST "${EIOTCLUB_URL}" -H 'Content-Type: application/json' \
+      -d "{\"iccid\":\"${iccid}\"}")" || return 1
+  fi
+  left="$(printf '%s' "${json}" | sed -n 's/.*"remain_str" *: *"\([^"]*\)".*/\1/p')"
+  total="$(printf '%s' "${json}" | sed -n 's/.*"total_str" *: *"\([^"]*\)".*/\1/p')"
+  [ -n "${left}" ] || { echo "eiotclub: no balance in the answer" >&2; return 1; }
+  echo "eSIM left: ${left} of ${total:-?} (EIOTCLUB's count, hours behind)"
+}
+
+# lock: one check at a time, so two runs can't both add the same bytes. A lock
+# left by a run that died is taken over.
+lock() {
+  if ! mkdir "${STATE}.lock" 2>/dev/null; then
+    pid="$(cat "${STATE}.lock/pid" 2>/dev/null)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then return 1; fi
+    rm -rf "${STATE}.lock"
+    mkdir "${STATE}.lock" 2>/dev/null || return 1
+  fi
+  echo "$$" >"${STATE}.lock/pid"
+  trap 'rm -rf "${STATE}.lock"' EXIT
+}
+
+# check: add the bytes since the last run to the day's count, push when it crosses
+# the next STEP_MB, and record the state.
+check() {
+  lock || { log "another check is still running; skipped"; return 0; }
+  t="$(now)"
+  load_state
+  if ! read_bytes; then
+    # No modem device: nothing to count. Keep the state, and the time of the last
+    # reading, so the next reading adds on and its rate covers the whole gap.
+    rate=0
+    save_state
+    return 0
+  fi
+  today="$(period "${t}")"
+  if [ "${day}" != "${today}" ]; then
+    day="${today}"
+    used=0
+    pushed=0
+  fi
+  if [ -z "${last}" ]; then
+    # First run (install, or after a reboot cleared /tmp): start from here.
+    delta=0
+  elif [ "${bytes}" -ge "${last}" ]; then
+    delta=$((bytes - last))
+  else
+    # The counter went back: the modem device was recreated. Count what it has.
+    delta="${bytes}"
+  fi
+  used=$((used + delta))
+  rate=0
+  elapsed=0
+  if [ -n "${checked}" ] && [ "${t}" -gt "${checked}" ]; then
+    elapsed=$((t - checked))
+    rate=$((delta * 8 / elapsed / 1000))
+  fi
+  add_hist "${t}" "${delta}"
+  top=
+  if [ "${delta}" -gt 0 ]; then
+    top_device "${elapsed}"
+  else
+    # Cellular is idle: nothing to attribute, so skip the connection table.
+    rm -f "${STATE}.flows" "${STATE}.dev"
+  fi
+  last="${bytes}"
+  checked="${t}"
+  if [ "${DRY_RUN}" = 1 ] || configured; then alert; fi
+  save_state
+}
+
+# alert: one push per STEP_MB crossed (250 MB, 500 MB, 750 MB, ...). A jump past
+# several steps pushes once. From URGENT_MB on, pushes are urgent.
+alert() {
+  step=$((used / (STEP_MB * MB)))
+  [ "${step}" -gt "${pushed}" ] || return 0
+  priority=0
+  [ -n "${URGENT_MB}" ] && [ "${used}" -ge $((URGENT_MB * MB)) ] && priority=1
+  msg="$(mb "${used}") of cellular data since ${RESET_HOUR}:00."
+  if [ "${rate}" -ge 1000 ]; then
+    msg="${msg} Now $(rate_str "${rate}"): something is streaming or downloading."
+  fi
+  if wifi_up; then
+    msg="${msg} Wi-Fi uplink is up."
+  else
+    msg="${msg} Wi-Fi uplink is off: all traffic is on the SIM."
+  fi
+  line="$(spark)"
+  [ -z "${line}" ] || msg="${msg}
+${line}"
+  [ -z "${top}" ] || msg="${msg}
+Top now: ${top}"
+  line="$(balance)"
+  [ -z "${line}" ] || msg="${msg}
+${line}"
+  push "${priority}" "${DEVICE_NAME} cellular $(mb "${used}")" "${msg}" && pushed="${step}"
+}
+
+status() {
+  load_state
+  if read_bytes; then
+    echo "modem:    ${CELL_DEV}, $(mb "${bytes}") since it came up"
+  else
+    echo "modem:    no ${CELL_DEV} device (no modem, or it is being reset)"
+  fi
+  if wifi_up; then echo "wifi:     uplink up"; else echo "wifi:     uplink off"; fi
+  if [ -n "${day}" ]; then
+    echo "used:     $(mb "${used}") on cellular since ${RESET_HOUR}:00 (day ${day})"
+    echo "rate:     $(rate_str "${rate}") at the last check"
+  fi
+  line="$(spark)"
+  [ -z "${line}" ] || echo "history:  ${line}"
+  [ ! -s "${STATE}.dev" ] || echo "devices:  $(sort -k2,2nr "${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (cellular bytes at the last check)"
+  line="$(balance)"
+  [ -z "${line}" ] || echo "balance:  ${line}"
+  urgent=never
+  [ -z "${URGENT_MB}" ] || urgent="from ${URGENT_MB} MB"
+  echo "alerts:   every ${STEP_MB} MB (pushed: $((pushed * STEP_MB)) MB), urgent ${urgent}"
+  if [ -n "${checked}" ]; then
+    echo "checked:  $(($(now) - checked))s ago (cron runs it every 2 minutes)"
+  else
+    echo "checked:  not yet (cron runs it every 2 minutes)"
+  fi
+  if configured; then
+    echo "pushover: keys set"
+  else
+    echo "pushover: keys MISSING, run: data-nag setup"
+  fi
+}
+
+reset() {
+  load_state
+  used=0
+  pushed=0
+  save_state
+  echo "count reset to 0 (until ${RESET_HOUR}:00 starts a new day)"
+}
+
+test_push() {
+  configured || { echo "no Pushover keys in ${CONF} or ${BATTERY_CONF}; run: data-nag setup" >&2; return 1; }
+  msg="Alerts work. You'll hear at every ${STEP_MB} MB of cellular data."
+  line="$(balance)"
+  [ -z "${line}" ] || msg="${msg}
+${line}"
+  push 0 "${DEVICE_NAME} data-nag test" "${msg}" && echo "test push sent"
+}
+
+setup() {
+  [ -w "${CONF}" ] || { echo "cannot write ${CONF}; run install first" >&2; return 1; }
+  printf 'Pushover user key (top of the pushover.net dashboard): '
+  read -r user
+  printf 'Pushover API token (an app for this router, pushover.net/apps/build): '
+  read -r token
+  for key in "${user}" "${token}"; do
+    case "${key}" in
+      '' | *[!A-Za-z0-9]*)
+        echo "Pushover keys are letters and digits only; nothing saved" >&2
+        return 1
+        ;;
+    esac
+  done
+  sed -i -e "s/^#* *PUSHOVER_USER=.*/PUSHOVER_USER=${user}/" \
+    -e "s/^#* *PUSHOVER_TOKEN=.*/PUSHOVER_TOKEN=${token}/" "${CONF}"
+  chmod 600 "${CONF}"
+  # shellcheck source=/dev/null
+  . "${CONF}"
+  if [ "${PUSHOVER_USER}" != "${user}" ] || [ "${PUSHOVER_TOKEN}" != "${token}" ]; then
+    echo "could not save the keys: ${CONF} needs PUSHOVER_USER= and PUSHOVER_TOKEN= lines" >&2
+    return 1
+  fi
+  echo "saved to ${CONF}"
+  test_push
+}
+
+write_conf() {
+  cat >"${CONF}" <<'EOF'
+# data-nag config, sourced as shell by /usr/bin/data-nag.
+# If battery-nag is installed, its Pushover keys and DEVICE_NAME are used, so
+# the key lines stay commented out. Otherwise fill them with `data-nag setup`.
+#PUSHOVER_USER=
+#PUSHOVER_TOKEN=
+#DEVICE_NAME=Router
+
+# Push once at every STEP_MB megabytes of cellular data (sent plus received) in
+# a day: 250 MB, 500 MB, 750 MB, ...
+STEP_MB=250
+
+# From this many megabytes on, each push is urgent (Pushover priority 1: it
+# sounds during quiet hours too). Empty: never urgent.
+URGENT_MB=1000
+
+# The hour (0-23, local time) the day's count goes back to zero. Noon, so a
+# night of streaming is one count instead of two halves split at midnight.
+RESET_HOUR=12
+
+# The modem's network device, and GL.iNet's name for the Wi-Fi uplink
+# (repeater) interface, which the push mentions.
+CELL_DEV=wwan0
+WIFI_IFACE=wwan
+
+# A command whose first line of output is added to each push, e.g. what the SIM
+# provider says is left. For an EIOTCLUB eSIM:
+#BALANCE_CMD="/usr/bin/data-nag eiotclub"
+# The ICCID is read from /etc/config/network; set it here if that fails.
+#ICCID=
+EOF
+}
+
+# append_line <file> <line>: add the line unless it is there, after a final newline.
+append_line() {
+  grep -qxF "$2" "$1" 2>/dev/null && return 0
+  [ ! -s "$1" ] || [ -z "$(tail -c 1 "$1")" ] || echo >>"$1"
+  echo "$2" >>"$1"
+}
+
+install() {
+  [ -d "/sys/class/net/${CELL_DEV}" ] \
+    || echo "install: no ${CELL_DEV} device right now; set CELL_DEV in ${CONF} if your modem uses another" >&2
+  command -v curl >/dev/null || { echo "install: needs curl (opkg install curl)" >&2; return 1; }
+
+  cp "$0" "${BIN}.new" && chmod 755 "${BIN}.new" && mv "${BIN}.new" "${BIN}" || return 1
+  [ -f "${CONF}" ] || write_conf
+  chmod 600 "${CONF}"
+
+  # The stock OpenWrt cron service runs crond on /etc/crontabs; GL.iNet's own
+  # crond on /tmp/gl_crontabs is left alone.
+  sed -i '/data-nag check/d' "${CRONTAB}" 2>/dev/null
+  append_line "${CRONTAB}" "${CRON_LINE}"
+  /etc/init.d/cron enable
+  /etc/init.d/cron restart
+
+  append_line /etc/sysupgrade.conf "${BIN}"
+  append_line /etc/sysupgrade.conf "${CONF}"
+
+  # Start counting from now, not from the bytes used since boot.
+  rm -rf "${STATE}" "${STATE}.dev" "${STATE}.flows" "${STATE}.flows.new" "${STATE}.lock"
+  check
+  echo "data-nag installed."
+  status
+}
+
+uninstall() {
+  if [ -f "${CRONTAB}" ]; then
+    sed -i '/data-nag/d' "${CRONTAB}"
+    # An empty /etc/crontabs leaves the stock cron service idle, as shipped.
+    [ -s "${CRONTAB}" ] || rm -f "${CRONTAB}"
+  fi
+  /etc/init.d/cron restart 2>/dev/null
+  sed -i -e "\\#^${BIN}\$#d" -e "\\#^${CONF}\$#d" /etc/sysupgrade.conf
+  rm -rf "${BIN}" "${CONF}" "${STATE}" "${STATE}.dev" "${STATE}.flows" "${STATE}.flows.new" "${STATE}.lock"
+  echo "data-nag removed."
+}
+
+case "${1:-}" in
+  check) check ;;
+  status) status ;;
+  setup) setup ;;
+  test) test_push ;;
+  reset) reset ;;
+  eiotclub) eiotclub ;;
+  install) install ;;
+  uninstall) uninstall ;;
+  *)
+    echo "usage: data-nag install|setup|status|test|check|reset|eiotclub|uninstall" >&2
+    exit 2
+    ;;
+esac

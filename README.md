@@ -1,4 +1,15 @@
-# battery-nag
+# glinet-utilities
+
+Small tools that run on a GL.iNet travel router and push to your phone when
+something needs you. Each is one POSIX shell file with no dependencies beyond
+what GL.iNet 4.x firmware ships, and none changes a GL.iNet file.
+
+| Tool | What it pushes |
+|---|---|
+| battery-nag (below) | The battery at 30%, 20% and 10%, and when it is full |
+| [data-nag](docs/data-nag.md) | Every 250 MB of cellular data, urgent from 1 GB, with a bar line of the last 3 hours, the busiest device and the eSIM balance |
+
+## battery-nag
 
 A GL.iNet travel router shuts down without a word when its battery runs flat, and
 takes your connection with it. battery-nag makes it warn you first: a push to your
@@ -13,7 +24,7 @@ Tested on a GL-XE300 (Puli), firmware 4.8.4 (OpenWrt 22.03). Other GL.iNet 4.x
 routers with a battery should work if `ubus call mcu status` prints a
 `charge_percent`.
 
-## What it sends
+### What it sends
 
 | When | Push |
 |---|---|
@@ -27,7 +38,7 @@ threshold (35% for the low alerts, 95% for full), so a reading that wobbles arou
 30% doesn't push twice. The thresholds, the name in the title, and the gap are
 all set in the config.
 
-## Install
+### Install
 
 You need SSH access to the router as root, and a Pushover account. Pushover is free
 for 30 days, then a one-time purchase per platform.
@@ -42,7 +53,7 @@ for 30 days, then a one-time purchase per platform.
 2. On the router (`ssh root@192.168.8.1`), fetch the script and install it:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/jotnguyen/battery-nag/main/openwrt/battery-nag -o /tmp/battery-nag
+   curl -fsSL https://raw.githubusercontent.com/jotnguyen/glinet-utilities/main/openwrt/battery-nag -o /tmp/battery-nag
    sh /tmp/battery-nag install
    ```
 
@@ -60,7 +71,7 @@ for 30 days, then a one-time purchase per platform.
 
    Paste both keys. It saves them and sends a test push.
 
-## What it changes on the router
+### What it changes on the router
 
 | Path | What |
 |---|---|
@@ -76,7 +87,7 @@ enabled but stays idle until `/etc/crontabs` has a file in it.
 
 To remove everything: `ssh root@192.168.8.1 battery-nag uninstall`.
 
-## Check on it
+### Check on it
 
 ```sh
 battery-nag status          # reading, which alerts fired, whether keys are set
@@ -84,7 +95,7 @@ battery-nag test            # send a test push
 logread -e battery-nag      # pushes sent and failed
 ```
 
-## Limits
+### Limits
 
 - **No uplink, no push.** If the router has neither cellular nor a Wi-Fi uplink,
   the alert can't get out. It retries every 2 minutes and goes out as soon as an
@@ -96,9 +107,10 @@ logread -e battery-nag      # pushes sent and failed
 
 ## Develop
 
-`openwrt/battery-nag` runs on BusyBox ash, so it is POSIX sh only.
-`sh test/run.sh` runs the scenarios with a faked battery reading and prints the
-pushes instead of sending them. CI runs the scenarios under dash and BusyBox ash,
+`openwrt/battery-nag` and `openwrt/data-nag` run on BusyBox ash, so they are
+POSIX sh only. `sh test/run.sh` and `sh test/data-nag.sh` run the scenarios with
+a faked battery reading or byte counter and print the pushes instead of sending
+them. CI runs the scenarios under dash and BusyBox ash,
 plus shellcheck and `scripts/hygiene.sh`, which keeps personal data out of this
 public repo. [docs/PLAN.md](docs/PLAN.md) has the design decisions and what's left.
 

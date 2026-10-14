@@ -53,6 +53,9 @@ goes nowhere.
 
 ## Later, if wanted
 
+- **Cellular data alert.** Done as [data-nag](data-nag.md): a push at every
+  250 MB of cellular data in a day, urgent from 1 GB. Written after a day of
+  streaming and a Windows update went over a travel eSIM with the Wi-Fi uplink off.
 - **Unplugged alert.** A push when the router drops to battery, e.g. when a hotel
   key-card slot cuts the outlet it's charging from. About five lines.
 - **Heartbeat.** A homelab could alert when the router goes silent for 30 minutes.
