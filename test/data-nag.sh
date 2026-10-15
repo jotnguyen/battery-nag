@@ -18,6 +18,14 @@ export DATA_NAG_STATE="${tmp}/state" DATA_NAG_CONF="${tmp}/conf" \
   DATA_NAG_CONNTRACK="${tmp}/ct" DATA_NAG_LEASES="${tmp}/leases" DATA_NAG_SAVED="${tmp}/saved"
 fails=0
 T0=1791918000 # 19:00 UTC
+# GL.iNet's BusyBox sort has only -n, -r and -u and silently ignores -k, so a sort
+# with -k or -t passes here and is wrong on the router. This sort refuses them.
+mkdir "${tmp}/bin"
+# shellcheck disable=SC2016 # the $ signs belong to the shim
+printf '#!/bin/sh\nfor a; do case "$a" in -k* | -t*) echo "sort $a: not on GL.iNet BusyBox" >&2; exit 2 ;; esac; done\nexec %s "$@"\n' \
+  "$(command -v sort)" >"${tmp}/bin/sort"
+chmod +x "${tmp}/bin/sort"
+PATH="${tmp}/bin:${PATH}"
 
 # run <minutes after T0> <counter MB> [env...]: one check; prints the dry-run lines.
 run() {

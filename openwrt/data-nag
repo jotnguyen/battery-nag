@@ -297,6 +297,13 @@ devices() {
   mv "${STATE}.flows.new" "${STATE}.flows"
 }
 
+# by_bytes: sort "<address> <bytes> ..." lines, the most bytes first. GL.iNet's
+# BusyBox sort has only -n, -r and -u and ignores -k, so the number goes in front
+# for the sort and comes off after.
+by_bytes() {
+  awk '{ print $2 " " $0 }' | sort -nr | awk '{ sub(/^[^ ]* /, ""); print }'
+}
+
 # per_device <file of "<address> <bytes> <kind>" lines>: one line per device,
 # "<address> <total bytes> <its biggest kind>".
 per_device() {
@@ -331,7 +338,7 @@ top_device() {
   add_day "${STATE}.kinds"
   per_device "${STATE}.kinds" >"${STATE}.dev"
   rm -f "${STATE}.kinds"
-  top="$(sort -k2,2nr "${STATE}.dev" | head -n 1 | named | awk -v el="$1" '
+  top="$(by_bytes <"${STATE}.dev" | head -n 1 | named | awk -v el="$1" '
     { k = $3; for (i = 4; i <= NF; i++) k = k " " $i
       if (el > 0) { r = $2 * 8 / el / 1000; rs = (r >= 1000) ? sprintf("%d Mbit/s", r / 1000) : sprintf("%d kbit/s", r); print $1 ", " rs ", " k }
       else print $1 ", " k }')"
@@ -343,7 +350,7 @@ today() {
   today_line=
   [ -s "${STATE}.day" ] || return 0
   [ "$(per_device "${STATE}.day" | wc -l)" -ge 2 ] || return 0
-  today_line="Today so far: $(per_device "${STATE}.day" | sort -k2,2nr | head -n 3 | named | awk "${AWK_MB}"'
+  today_line="Today so far: $(per_device "${STATE}.day" | by_bytes | head -n 3 | named | awk "${AWK_MB}"'
     { printf "%s%s %s", (NR > 1 ? ", " : ""), $1, mb($2) }')"
 }
 
@@ -502,7 +509,7 @@ status() {
   fi
   line="$(spark)"
   [ -z "${line}" ] || echo "history:  ${line}"
-  [ ! -s "${STATE}.dev" ] || echo "devices:  $(sort -k2,2nr "${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (cellular bytes at the last check)"
+  [ ! -s "${STATE}.dev" ] || echo "devices:  $(by_bytes <"${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (cellular bytes at the last check)"
   line="$(balance)"
   [ -z "${line}" ] || echo "balance:  ${line}"
   today
@@ -537,10 +544,10 @@ report() {
   if [ -s "${STATE}.day" ]; then
     # Its own file name, as report may run while cron's check does.
     devs="${STATE}.report.$$"
-    per_device "${STATE}.day" | sort -k2,2nr >"${devs}"
+    per_device "${STATE}.day" | by_bytes >"${devs}"
     # The day's lines biggest first, then the devices biggest first; each device
     # prints with its kinds in that order.
-    sort -k2,2nr "${STATE}.day" | awk "${AWK_MB}"'
+    by_bytes <"${STATE}.day" | awk "${AWK_MB}"'
       FNR == NR { k = $3; for (i = 4; i <= NF; i++) k = k " " $i
         sep = ($1 in kinds) ? ", " : ""; kinds[$1] = kinds[$1] sep k " " mb($2); next }
       { printf "  %s %s: %s\n", $1, mb($2), kinds[$1]; sum += $2 }
