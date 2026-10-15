@@ -13,6 +13,11 @@ SH="${SH:-sh}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 export BATTERY_NAG_STATE="${tmp}/state" BATTERY_NAG_CONF="${tmp}/conf"
+# The test runs don't write to the real system log: logger does nothing here.
+mkdir "${tmp}/bin"
+printf '#!/bin/sh\nexit 0\n' >"${tmp}/bin/logger"
+chmod +x "${tmp}/bin/logger"
+PATH="${tmp}/bin:${PATH}"
 fails=0
 
 # nag <percent> <plugged> [env...]: run one check, print "p<priority> <title>" or "-".

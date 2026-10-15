@@ -25,6 +25,9 @@ mkdir "${tmp}/bin"
 printf '#!/bin/sh\nfor a; do case "$a" in -k* | -t*) echo "sort $a: not on GL.iNet BusyBox" >&2; exit 2 ;; esac; done\nexec %s "$@"\n' \
   "$(command -v sort)" >"${tmp}/bin/sort"
 chmod +x "${tmp}/bin/sort"
+# Nor do the test runs write to the real system log: logger does nothing here.
+printf '#!/bin/sh\nexit 0\n' >"${tmp}/bin/logger"
+chmod +x "${tmp}/bin/logger"
 PATH="${tmp}/bin:${PATH}"
 
 # run <minutes after T0> <counter MB> [env...]: one check; prints the dry-run lines.
