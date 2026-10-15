@@ -16,9 +16,8 @@ and at heavy use the first push already means 250 MB is gone.
   (repeater) is down, and that has lasted `CELL_ONLY_MIN` minutes, push once: "Router on
   cellular only for 15 min (40 MB). Reconnect the repeater if a Wi-Fi network is in range."
 - Re-arm when the repeater is up again.
-- "Cellular up" = `ubus call network.interface.<modem iface> status` reports `up: true`. Find the
-  interface from `uci show network` (the `proto=qcm|qmi|mbim` section), the way `eiotclub` finds
-  the ICCID.
+- "Cellular up" = the modem device has an IPv4 address, which data-nag already reads (`cell_ip`).
+  See the hand-off below; no new uci or ubus parsing is needed.
 - Optional, off by default: `CELL_ONLY_REPEAT_MIN` to push again every N minutes while it lasts.
 
 ## Acceptance
@@ -51,7 +50,9 @@ the router.
   Wi-Fi-down was first seen, empty otherwise) and `solo_pushed` (0/1).
 - In `check()`, after `read_bytes` succeeds and independent of `delta` (light use must still
   alert): if cellular is up and `wifi_up` is false, set `solo_since` if empty; once
-  `t - solo_since >= CELL_ONLY_MIN * 60` and `solo_pushed = 0`, push priority 0:
+  `t - solo_since >= CELL_ONLY_MIN * 60` and `solo_pushed = 0`, push. Priority 0 by day, and
+  priority 1 between 22:00 and 07:00 local (`CELL_ONLY_URGENT_HOURS="22 7"`): this tends to
+  start in the evening, and Pushover quiet hours would hold a priority-0 push until morning:
   "<name> on cellular only for <n> min (<mb used>). Reconnect the repeater if a Wi-Fi network is
   in range." Set `solo_pushed=1` only if the push succeeded. Otherwise clear both.
 - `CELL_ONLY_MIN=15` in the defaults and in `write_conf`'s commented config; empty turns it off.
@@ -60,7 +61,8 @@ the router.
 
 **Tests to add** to `test/data-nag.sh` (dash and BusyBox, both must pass): 14 min solo → no push;
 16 min → one push; still solo at 30 min → no second push; Wi-Fi back → re-armed, so a new solo
-spell pushes again; both up → nothing; cellular down → nothing; a failed push is retried.
+spell pushes again; both up → nothing; cellular down → nothing; a failed push is retried; a spell
+starting at 23:00 pushes at priority 1, one at 14:00 at priority 0.
 
 **Rules that bite here:**
 

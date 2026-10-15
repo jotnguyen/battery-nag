@@ -12,8 +12,11 @@ uninstall, the riskiest code (cron, `/etc/sysupgrade.conf`), have no automated t
 
 ## Options
 
-- (a) Keep the copies, and add a CI check that the shared functions are identical in both
-  files (extract them by name and diff them).
+- (a) Keep the copies, and add a CI check that the functions meant to match are identical in both
+  files (extract them by name and diff them). Today only `push` and `append_line` match exactly;
+  `setup`, `install`, `uninstall`, `test_push` and `write_conf` differ on purpose (config
+  names, the modem check, state files). Either list the matching ones in the check, or first
+  move the differences into variables so more functions can match.
 - (b) A `lib/common.sh` concatenated into each script by a tiny build step, with the built
   files committed so `curl` still works. CI fails if they're stale.
 - (c) One multi-call script, `glinet-utilities battery|data ...`. Simplest code, but a bigger

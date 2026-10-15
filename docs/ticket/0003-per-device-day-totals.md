@@ -19,7 +19,9 @@ them away after picking the top device.
   devices.
 - Known gap: bytes on a connection that closes between two checks are missed. If that turns out
   large (compare the day total against the modem counter in `report`), consider reading
-  `conntrack -E` events instead (needs the `conntrack` tool, which GL.iNet 4.x ships).
+  `conntrack -E` events instead (the `conntrack` tool is on GL.iNet 4.x). That needs a resident
+  listener started by procd (an init script), not the 2-minute cron check, so it is a bigger
+  change: a new service, its own state, and an uninstall that stops it.
 
 ## Acceptance
 
