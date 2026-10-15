@@ -11,12 +11,14 @@
 # Each push says how much, how fast, and whether the Wi-Fi uplink is up, then adds:
 # a bar line of the last 3 hours in 10-minute steps, the device using the most
 # right now and what kind of traffic it is (from the kernel's connection table),
-# and, if BALANCE_CMD is set, what the SIM provider says is left.
+# and, if BALANCE_CMD is set, what the SIM provider says is left. Once two or more
+# devices have used cellular in a day, it adds each one's total so far.
 #
 # Usage (on the router, as root):
 #   sh data-nag install   # copy itself to /usr/bin, add the config and a cron line
 #   data-nag setup        # ask for the Pushover keys, save them, send a test push
 #   data-nag status       # today's count, the last 3 hours, top device, balance
+#   data-nag report       # the day per device and kind of traffic, the last 48 h per hour
 #   data-nag test         # send a test push
 #   data-nag check        # what cron runs every 2 minutes
 #   data-nag reset        # start counting from zero again (until the next reset)
@@ -25,8 +27,11 @@
 #
 # Config: /etc/data-nag.conf (shell variables). If it has no Pushover keys, the
 #         ones in /etc/battery-nag.conf are used.
-# State:  /tmp/data-nag.state, .state.flows and .state.dev (RAM, so a reboot starts
-#         the count again; the modem's counter starts again at a reboot too).
+# State:  /tmp/data-nag.state, .state.day, .state.flows and .state.dev (RAM). While
+#         cellular moves data, the state and the day's device table are copied to
+#         /etc/data-nag.saved* (flash) at most every SAVE_MIN minutes, and a check
+#         after a restart carries on from that copy. See docs/data-nag.md for why that
+#         is safe for the flash.
 # Tests:  DATA_NAG_BYTES="<total bytes>" stands in for the counter, DATA_NAG_NOW
 #         for the clock, DATA_NAG_WIFI=0|1 for the Wi-Fi uplink, DATA_NAG_CONNTRACK
 #         and DATA_NAG_LEASES for the connection table and DHCP leases, and
@@ -37,6 +42,7 @@ set -u
 CONF="${DATA_NAG_CONF:-/etc/data-nag.conf}"
 BATTERY_CONF="${DATA_NAG_BATTERY_CONF:-/etc/battery-nag.conf}"
 STATE="${DATA_NAG_STATE:-/tmp/data-nag.state}"
+SAVED="${DATA_NAG_SAVED:-/etc/data-nag.saved}"
 CONNTRACK="${DATA_NAG_CONNTRACK:-/proc/net/nf_conntrack}"
 LEASES="${DATA_NAG_LEASES:-/tmp/dhcp.leases}"
 BIN=/usr/bin/data-nag
@@ -53,6 +59,7 @@ WIFI_IFACE=wwan
 STEP_MB=250
 URGENT_MB=1000
 RESET_HOUR=12
+SAVE_MIN=10
 LAN_PREFIX=
 BALANCE_CMD=
 ICCID=
@@ -65,6 +72,9 @@ DRY_RUN="${DRY_RUN:-0}"
 MB=1000000
 BUCKET=600   # seconds per bar in the history line
 BUCKETS=18   # bars kept: 3 hours
+HOURS=48     # hourly bars kept for report: 2 days
+# awk: mb(bytes) as the shell's mb() below prints it.
+AWK_MB='function mb(b) { return (b < 1e9) ? sprintf("%d MB", b / 1e6) : sprintf("%d.%d GB", b / 1e9, (b % 1e9) / 1e8) }'
 
 log() {
   logger -t data-nag "$*" 2>/dev/null || true
@@ -141,31 +151,85 @@ load_state() {
   rate=0
   hist=
   bkt=
+  hours=
+  hbkt=
+  saved=0
+  unsaved=0
+  if [ ! -r "${STATE}" ] && [ -n "${SAVE_MIN}" ] && [ -r "${SAVED}" ]; then
+    # /tmp is empty but flash has a copy: the router restarted. Carry on from the
+    # copy. The modem's counter started again at the restart, so all of it is new.
+    # shellcheck source=/dev/null
+    . "${SAVED}"
+    last=0
+    rm -f "${STATE}.day"
+    [ ! -r "${SAVED}.day" ] || cp "${SAVED}.day" "${STATE}.day"
+    save_state
+    log "restarted: carrying on from the count saved at $(date -d "@${saved}" +%H:%M)"
+  fi
   # shellcheck source=/dev/null
   [ -r "${STATE}" ] && . "${STATE}"
 }
 
 save_state() {
-  printf "day=%s\nused=%s\nlast=%s\npushed=%s\nchecked=%s\nrate=%s\nhist='%s'\nbkt=%s\n" \
-    "${day}" "${used}" "${last}" "${pushed}" "${checked}" "${rate}" "${hist}" "${bkt}" >"${STATE}"
+  printf "day=%s\nused=%s\nlast=%s\npushed=%s\nchecked=%s\nrate=%s\nhist='%s'\nbkt=%s\nhours='%s'\nhbkt=%s\nsaved=%s\nunsaved=%s\n" \
+    "${day}" "${used}" "${last}" "${pushed}" "${checked}" "${rate}" "${hist}" "${bkt}" \
+    "${hours}" "${hbkt}" "${saved}" "${unsaved}" >"${STATE}"
 }
 
-# add_hist <epoch> <bytes>: add the bytes to the current 10-minute bar, starting
-# new (empty) bars for the time that has passed, and keep the last BUCKETS.
-add_hist() {
-  b=$(($1 / BUCKET))
-  if [ -z "${hist}" ] || [ -z "${bkt}" ] || [ "${b}" -lt "${bkt}" ]; then
-    hist=0
-    bkt="${b}"
+# save_flash <epoch>: copy the state and the day's device table to flash. Each file
+# is written beside the old one and renamed over it, so a power cut leaves the old
+# copy or the new one, never half of one.
+save_flash() {
+  saved="$1"
+  unsaved=0
+  save_state
+  if ! { cp "${STATE}" "${SAVED}.new" && mv "${SAVED}.new" "${SAVED}"; }; then
+    log "could not save to ${SAVED}"
+    return 1
   fi
-  hist="$(echo "${hist}" | awk -v n=$((b - bkt)) -v d="$2" -v keep="${BUCKETS}" '{
+  if [ -s "${STATE}.day" ]; then
+    cp "${STATE}.day" "${SAVED}.day.new" && mv "${SAVED}.day.new" "${SAVED}.day"
+  else
+    rm -f "${SAVED}.day"
+  fi
+}
+
+# roll <bars> <last bar's index> <now's index> <bytes> <keep>: print the bars with
+# empty ones added for the time that has passed, the bytes added to the last one,
+# and only the last <keep> kept.
+roll() {
+  echo "$1" | awk -v n=$(($3 - $2)) -v d="$4" -v keep="$5" '{
     m = NF; for (i = 1; i <= NF; i++) a[i] = $i
     for (j = 0; j < n && j < keep; j++) a[++m] = 0
     a[m] += d
     out = ""; sep = ""
     for (i = (m > keep ? m - keep + 1 : 1); i <= m; i++) { out = out sep sprintf("%.0f", a[i]); sep = " " }
-    print out }')"
+    print out }'
+}
+
+# add_hist <epoch> <bytes>: add the bytes to the current 10-minute bar (the last
+# BUCKETS of them make the bar line) and to the current hour (the last HOURS of
+# them make the report). If the clock is a little behind the last bar (less than
+# the bars kept), the bytes go into the last bar: after a restart the router's
+# clock starts from the newest file in /etc (it has no clock battery) until NTP
+# sets it, which can be minutes behind. Further behind, the bars start again.
+add_hist() {
+  b=$(($1 / BUCKET))
+  if [ -z "${hist}" ] || [ -z "${bkt}" ] || [ $((bkt - b)) -ge "${BUCKETS}" ]; then
+    hist=0
+    bkt="${b}"
+  fi
+  [ "${b}" -ge "${bkt}" ] || b="${bkt}"
+  hist="$(roll "${hist}" "${bkt}" "${b}" "$2" "${BUCKETS}")"
   bkt="${b}"
+  b=$(($1 / 3600))
+  if [ -z "${hours}" ] || [ -z "${hbkt}" ] || [ $((hbkt - b)) -ge "${HOURS}" ]; then
+    hours=0
+    hbkt="${b}"
+  fi
+  [ "${b}" -ge "${hbkt}" ] || b="${hbkt}"
+  hours="$(roll "${hours}" "${hbkt}" "${b}" "$2" "${HOURS}")"
+  hbkt="${b}"
 }
 
 # spark: the history as a bar line, e.g. "Last 3 h ▁▁▂▅█▇ (10-min bars, peak 180 MB)".
@@ -196,13 +260,12 @@ cell_ip() {
   fi
 }
 
-# devices: one line per LAN device, "<address> <bytes since last check> <kind>",
-# for connections that leave over the cellular address. Bytes are counted per
-# connection against the last check's table (${STATE}.flows), so connections that
-# open and close between checks still count, and a closed one can't make a
-# device's total go backwards. The kind is the one with the most of those bytes,
-# guessed from protocol and port. Prints nothing on the first check, which only
-# records the table.
+# devices: one line per LAN device and kind of traffic, "<address> <bytes since
+# last check> <kind>", for connections that leave over the cellular address. Bytes
+# are counted per connection against the last check's table (${STATE}.flows), so
+# connections that open and close between checks still count, and a closed one
+# can't make a device's total go backwards. The kind is guessed from protocol and
+# port. Prints nothing on the first check, which only records the table.
 devices() {
   wan="$(cell_ip)"
   { [ -r "${CONNTRACK}" ] && [ -n "${wan}" ]; } || { rm -f "${STATE}.flows"; return 0; }
@@ -231,29 +294,69 @@ devices() {
     else if (dport == "53") k = "DNS"
     else if (proto == "udp" && dport == "51820") k = "WireGuard VPN"
     else k = "other"
-    tot[src] += d; per[src SUBSEP k] += d; kinds[k] = 1
+    per[src SUBSEP k] += d
   } END {
     if (first) exit
-    for (s in tot) {
-      if (tot[s] <= 0) continue
-      best = ""; bb = -1
-      for (k in kinds) if (per[s SUBSEP k] > bb) { bb = per[s SUBSEP k]; best = k }
-      printf "%s %.0f %s\n", s, tot[s], best
-    } }' "${STATE}.flows" "${CONNTRACK}"
+    for (x in per) if (per[x] > 0) { split(x, p, SUBSEP); printf "%s %.0f %s\n", p[1], per[x], p[2] }
+  }' "${STATE}.flows" "${CONNTRACK}"
   mv "${STATE}.flows.new" "${STATE}.flows"
+}
+
+# by_bytes: sort "<address> <bytes> ..." lines, the most bytes first. GL.iNet's
+# BusyBox sort has only -n, -r and -u and ignores -k, so the number goes in front
+# for the sort and comes off after.
+by_bytes() {
+  awk '{ print $2 " " $0 }' | sort -nr | awk '{ sub(/^[^ ]* /, ""); print }'
+}
+
+# per_device <file of "<address> <bytes> <kind>" lines>: one line per device,
+# "<address> <total bytes> <its biggest kind>".
+per_device() {
+  awk '{ k = $3; for (i = 4; i <= NF; i++) k = k " " $i
+    tot[$1] += $2; if ($2 > big[$1]) { big[$1] = $2; kind[$1] = k } }
+    END { for (a in tot) printf "%s %.0f %s\n", a, tot[a], kind[a] }' "$1"
+}
+
+# named: replace each line's first word, a LAN address, with its name in the DHCP
+# leases, where it has one.
+named() {
+  awk -v leases="${LEASES}" '
+    BEGIN { while ((getline l < leases) > 0) { split(l, f, " "); if (f[4] != "*") name[f[3]] = f[4] } }
+    { if ($1 in name) $1 = name[$1]; print }'
+}
+
+# add_day <file of "<address> <bytes> <kind>" lines>: add them to the day's table,
+# ${STATE}.day, one line per device and kind.
+add_day() {
+  [ -s "$1" ] || return 0
+  cat "${STATE}.day" "$1" 2>/dev/null | awk '{ k = $3; for (i = 4; i <= NF; i++) k = k " " $i; s[$1 SUBSEP k] += $2 }
+    END { for (x in s) { split(x, p, SUBSEP); printf "%s %.0f %s\n", p[1], s[x], p[2] } }' >"${STATE}.day.new"
+  mv "${STATE}.day.new" "${STATE}.day"
 }
 
 # top_device <seconds since last check>: set top to "laptop, 15 Mbit/s, HTTPS",
 # the device that moved the most cellular bytes since the last check, named from
-# the DHCP leases. Keeps the per-device table in ${STATE}.dev for status.
+# the DHCP leases. Adds the check's bytes to the day's table, and keeps the
+# check's per-device table in ${STATE}.dev for status.
 top_device() {
-  devices >"${STATE}.dev"
-  top="$(sort -k2,2nr "${STATE}.dev" | head -n 1 | awk -v el="$1" -v leases="${LEASES}" '
-    BEGIN { while ((getline l < leases) > 0) { split(l, f, " "); if (f[4] != "*") name[f[3]] = f[4] } }
-    { n = ($1 in name) ? name[$1] : $1
-      k = $3; for (i = 4; i <= NF; i++) k = k " " $i
-      if (el > 0) { r = $2 * 8 / el / 1000; rs = (r >= 1000) ? sprintf("%d Mbit/s", r / 1000) : sprintf("%d kbit/s", r); print n ", " rs ", " k }
-      else print n ", " k }')"
+  devices >"${STATE}.kinds"
+  add_day "${STATE}.kinds"
+  per_device "${STATE}.kinds" >"${STATE}.dev"
+  rm -f "${STATE}.kinds"
+  top="$(by_bytes <"${STATE}.dev" | head -n 1 | named | awk -v el="$1" '
+    { k = $3; for (i = 4; i <= NF; i++) k = k " " $i
+      if (el > 0) { r = $2 * 8 / el / 1000; rs = (r >= 1000) ? sprintf("%d Mbit/s", r / 1000) : sprintf("%d kbit/s", r); print $1 ", " rs ", " k }
+      else print $1 ", " k }')"
+}
+
+# today: set today_line to "Today so far: laptop 6.1 GB, phone 900 MB" (the top
+# three) once two or more devices have used cellular today.
+today() {
+  today_line=
+  [ -s "${STATE}.day" ] || return 0
+  [ "$(per_device "${STATE}.day" | wc -l)" -ge 2 ] || return 0
+  today_line="Today so far: $(per_device "${STATE}.day" | by_bytes | head -n 3 | named | awk "${AWK_MB}"'
+    { printf "%s%s %s", (NR > 1 ? ", " : ""), $1, mb($2) }')"
 }
 
 # balance: the first line BALANCE_CMD prints, e.g. what the SIM provider says is
@@ -328,6 +431,7 @@ check() {
     day="${today}"
     used=0
     pushed=0
+    rm -f "${STATE}.day"
   fi
   if [ -z "${last}" ]; then
     # First run (install, or after a reboot cleared /tmp): start from here.
@@ -356,7 +460,14 @@ check() {
   last="${bytes}"
   checked="${t}"
   if [ "${DRY_RUN}" = 1 ] || configured; then alert; fi
-  save_state
+  # Flash gets a copy only when cellular moved data since the last copy, and at
+  # most every SAVE_MIN minutes: none while the SIM is idle.
+  unsaved=$((unsaved + delta))
+  if [ -n "${SAVE_MIN}" ] && [ "${unsaved}" -gt 0 ] && [ $((t - saved)) -ge $((SAVE_MIN * 60)) ]; then
+    save_flash "${t}"
+  else
+    save_state
+  fi
 }
 
 # alert: one push per STEP_MB crossed (250 MB, 500 MB, 750 MB, ...). A jump past
@@ -380,6 +491,9 @@ alert() {
 ${line}"
   [ -z "${top}" ] || msg="${msg}
 Top now: ${top}"
+  today
+  [ -z "${today_line}" ] || msg="${msg}
+${today_line}"
   line="$(balance)"
   [ -z "${line}" ] || msg="${msg}
 ${line}"
@@ -400,12 +514,21 @@ status() {
   fi
   line="$(spark)"
   [ -z "${line}" ] || echo "history:  ${line}"
-  [ ! -s "${STATE}.dev" ] || echo "devices:  $(sort -k2,2nr "${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (cellular bytes at the last check)"
+  [ ! -s "${STATE}.dev" ] || echo "devices:  $(by_bytes <"${STATE}.dev" | head -n 3 | awk '{ printf "%s%s %d MB", (NR > 1 ? "; " : ""), $1, $2 / 1000000 }') (cellular bytes at the last check)"
   line="$(balance)"
   [ -z "${line}" ] || echo "balance:  ${line}"
+  today
+  [ -z "${today_line}" ] || echo "today:    ${today_line#Today so far: } (data-nag report for more)"
   urgent=never
   [ -z "${URGENT_MB}" ] || urgent="from ${URGENT_MB} MB"
   echo "alerts:   every ${STEP_MB} MB (pushed: $((pushed * STEP_MB)) MB), urgent ${urgent}"
+  if [ -z "${SAVE_MIN}" ]; then
+    echo "saved:    off (SAVE_MIN is empty: a restart starts the count again)"
+  elif [ "${saved}" -gt 0 ]; then
+    echo "saved:    to ${SAVED} $((($(now) - saved) / 60)) min ago (every ${SAVE_MIN} min while cellular is in use)"
+  else
+    echo "saved:    not yet (every ${SAVE_MIN} min while cellular is in use)"
+  fi
   if [ -n "${checked}" ]; then
     echo "checked:  $(($(now) - checked))s ago (cron runs it every 2 minutes)"
   else
@@ -418,11 +541,51 @@ status() {
   fi
 }
 
+# report: the day so far per device, each with its kinds of traffic, how much of
+# the modem's count that accounts for, and the last HOURS hours one per line.
+report() {
+  load_state
+  echo "Cellular since ${RESET_HOUR}:00 (day ${day:-none yet}): $(mb "${used}")"
+  if [ -s "${STATE}.day" ]; then
+    # Its own file name, as report may run while cron's check does.
+    devs="${STATE}.report.$$"
+    per_device "${STATE}.day" | by_bytes >"${devs}"
+    # The day's lines biggest first, then the devices biggest first; each device
+    # prints with its kinds in that order.
+    by_bytes <"${STATE}.day" | awk "${AWK_MB}"'
+      FNR == NR { k = $3; for (i = 4; i <= NF; i++) k = k " " $i
+        sep = ($1 in kinds) ? ", " : ""; kinds[$1] = kinds[$1] sep k " " mb($2); next }
+      { printf "  %s %s: %s\n", $1, mb($2), kinds[$1]; sum += $2 }
+      END { if (u > 0) printf "  The devices add up to %d%% of that (connections that open and close between checks are missed).\n", sum * 100 / u }' \
+      - u="${used}" "${devs}" | named_indented
+    rm -f "${devs}"
+  else
+    echo "  No device has used cellular yet today."
+  fi
+  echo "Per hour, last ${HOURS} h:"
+  any=0
+  [ -z "${hbkt}" ] || i=$((hbkt - $(echo "${hours}" | wc -w) + 1))
+  for b in ${hours}; do
+    if [ "${b}" -gt 0 ]; then
+      echo "  $(date -d "@$((i * 3600))" '+%a %H:%M')  $(mb "${b}")"
+      any=1
+    fi
+    i=$((i + 1))
+  done
+  [ "${any}" = 1 ] || echo "  none"
+}
+
+# named_indented: named, for lines that start with two spaces and an address.
+named_indented() {
+  sed 's/^  //' | named | sed 's/^/  /'
+}
+
 reset() {
   load_state
   used=0
   pushed=0
-  save_state
+  rm -f "${STATE}.day"
+  if [ -n "${SAVE_MIN}" ]; then save_flash "$(now)"; else save_state; fi
   echo "count reset to 0 (until ${RESET_HOUR}:00 starts a new day)"
 }
 
@@ -483,6 +646,12 @@ URGENT_MB=1000
 # night of streaming is one count instead of two halves split at midnight.
 RESET_HOUR=12
 
+# While cellular moves data, copy the day's count and device table to flash
+# (/etc/data-nag.saved*) at most every this many minutes, so a restart carries
+# on instead of starting from zero. Nothing is written while the SIM stays idle.
+# Empty: never write to flash.
+SAVE_MIN=10
+
 # The modem's network device, and GL.iNet's name for the Wi-Fi uplink
 # (repeater) interface, which the push mentions.
 CELL_DEV=wwan0
@@ -523,7 +692,7 @@ install() {
   append_line /etc/sysupgrade.conf "${CONF}"
 
   # Start counting from now, not from the bytes used since boot.
-  rm -rf "${STATE}" "${STATE}.dev" "${STATE}.flows" "${STATE}.flows.new" "${STATE}.lock"
+  rm -rf "${STATE}" "${STATE}".* "${SAVED}" "${SAVED}".*
   check
   echo "data-nag installed."
   status
@@ -537,13 +706,14 @@ uninstall() {
   fi
   /etc/init.d/cron restart 2>/dev/null
   sed -i -e "\\#^${BIN}\$#d" -e "\\#^${CONF}\$#d" /etc/sysupgrade.conf
-  rm -rf "${BIN}" "${CONF}" "${STATE}" "${STATE}.dev" "${STATE}.flows" "${STATE}.flows.new" "${STATE}.lock"
+  rm -rf "${BIN}" "${CONF}" "${STATE}" "${STATE}".* "${SAVED}" "${SAVED}".*
   echo "data-nag removed."
 }
 
 case "${1:-}" in
   check) check ;;
   status) status ;;
+  report) report ;;
   setup) setup ;;
   test) test_push ;;
   reset) reset ;;
@@ -551,7 +721,7 @@ case "${1:-}" in
   install) install ;;
   uninstall) uninstall ;;
   *)
-    echo "usage: data-nag install|setup|status|test|check|reset|eiotclub|uninstall" >&2
+    echo "usage: data-nag install|setup|status|report|test|check|reset|eiotclub|uninstall" >&2
     exit 2
     ;;
 esac
