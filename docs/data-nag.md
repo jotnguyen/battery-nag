@@ -105,8 +105,9 @@ history is gone.
 
 So while cellular moves data, data-nag copies its state and the day table to
 `/etc/data-nag.saved` and `/etc/data-nag.saved.day` (flash), at most every
-`SAVE_MIN` minutes (10). Nothing is written while the SIM is idle. After a restart
-`/tmp` is empty, so the next check reads the copy and adds the modem's counter,
+`SAVE_MIN` minutes (10). One more copy goes out after the SIM goes quiet, then
+nothing while it stays idle. After a restart `/tmp` is empty, so the next check
+reads the copy and adds the modem's counter,
 which also started from zero at the restart. At most the last `SAVE_MIN` minutes of
 counting are lost. Each file is written beside the old one and renamed over it, so
 a power cut mid-write leaves the old copy or the new one, never half of one.
@@ -120,7 +121,7 @@ Measured on a GL-XE300 (firmware 4.8.4) on 2026-10-15:
 
 | | |
 |---|---|
-| Flash for settings | 128 MiB SPI NAND (GigaDevice), single-level cell: the durable kind, not an SD card or eMMC |
+| Flash for settings | 128 MiB SPI NAND, 2 KiB pages. The kernel names the maker (GigaDevice) at boot but not the part number. SPI NAND this size is single-level cell, the durable kind: not an SD card or eMMC |
 | Layout | 1024 erase blocks of 128 KiB, 0 bad, 20 kept spare. `/overlay` (where `/etc` changes go) is UBIFS on UBI, 92.7 MB, 2% used |
 | Wear so far | UBI's erase counter: highest block 7, average 3, since the firmware was written in April 2023 |
 
@@ -135,9 +136,8 @@ The numbers, taking the worst case at every step:
   counters you can read). 144 / 1024 is 0.14 erases per block per day, about 50 a
   year.
 - **Endurance.** GigaDevice rates its GD5F SPI NAND family at 100,000 erase cycles
-  per block. Take a tenth of that, 10,000, and 50 a year lasts about 200 years.
-  At the full rating, about 2,000.
-
+  per block. That is a family figure, since the exact part is unknown. Take a tenth
+  of it, 10,000, and 50 a year lasts about 200 years. At the full rating, about 2,000.
 The thing that does wear flash out is many writes landing on the same few blocks
 with nothing spreading them, as on a cheap SD card. UBI is there to prevent that,
 and the counters show it working: three years of GL.iNet's own config and client

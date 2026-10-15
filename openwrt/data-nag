@@ -209,20 +209,25 @@ roll() {
 
 # add_hist <epoch> <bytes>: add the bytes to the current 10-minute bar (the last
 # BUCKETS of them make the bar line) and to the current hour (the last HOURS of
-# them make the report).
+# them make the report). If the clock is a little behind the last bar (less than
+# the bars kept), the bytes go into the last bar: after a restart the router's
+# clock starts from the newest file in /etc (it has no clock battery) until NTP
+# sets it, which can be minutes behind. Further behind, the bars start again.
 add_hist() {
   b=$(($1 / BUCKET))
-  if [ -z "${hist}" ] || [ -z "${bkt}" ] || [ "${b}" -lt "${bkt}" ]; then
+  if [ -z "${hist}" ] || [ -z "${bkt}" ] || [ $((bkt - b)) -ge "${BUCKETS}" ]; then
     hist=0
     bkt="${b}"
   fi
+  [ "${b}" -ge "${bkt}" ] || b="${bkt}"
   hist="$(roll "${hist}" "${bkt}" "${b}" "$2" "${BUCKETS}")"
   bkt="${b}"
   b=$(($1 / 3600))
-  if [ -z "${hours}" ] || [ -z "${hbkt}" ] || [ "${b}" -lt "${hbkt}" ]; then
+  if [ -z "${hours}" ] || [ -z "${hbkt}" ] || [ $((hbkt - b)) -ge "${HOURS}" ]; then
     hours=0
     hbkt="${b}"
   fi
+  [ "${b}" -ge "${hbkt}" ] || b="${hbkt}"
   hours="$(roll "${hours}" "${hbkt}" "${b}" "$2" "${HOURS}")"
   hbkt="${b}"
 }
@@ -643,7 +648,7 @@ RESET_HOUR=12
 
 # While cellular moves data, copy the day's count and device table to flash
 # (/etc/data-nag.saved*) at most every this many minutes, so a restart carries
-# on instead of starting from zero. Nothing is written while the SIM is idle.
+# on instead of starting from zero. Nothing is written while the SIM stays idle.
 # Empty: never write to flash.
 SAVE_MIN=10
 

@@ -232,6 +232,14 @@ step 32 245 -
 rm -rf "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
 step 34 20 "p0 Puli cellular 265 MB" "restarted: 245 MB from flash plus the counter's 20 MB since the restart"
 step 36 260 "p0 Puli cellular 505 MB" "and the count goes on from there"
+bars() { sed -n "s/^${1}='\(.*\)'$/\1/p" "${DATA_NAG_STATE}" | wc -w | tr -d ' '; }
+n10="$(bars hist)"
+run 29 300 >/dev/null
+expect "clock a few minutes behind (no clock battery): the bars are kept" [ "$(bars hist)" = "${n10}" ]
+expect "and the bytes still count" grep -qx 'used=545000000' "${DATA_NAG_STATE}"
+run 2000 310 >/dev/null
+run 100 320 >/dev/null
+expect "clock far behind: the bars start again" [ "$(bars hist)" = 1 ]
 fresh
 printf 'DEVICE_NAME=Puli\nSAVE_MIN=\n' >"${DATA_NAG_CONF}"
 run 0 0 >/dev/null
