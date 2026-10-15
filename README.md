@@ -7,7 +7,7 @@ what GL.iNet 4.x firmware ships, and none changes a GL.iNet file.
 | Tool | What it pushes |
 |---|---|
 | battery-nag (below) | The battery at 30%, 20% and 10%, and when it is full |
-| [data-nag](docs/data-nag.md) | Every 250 MB of cellular data, urgent from 1 GB, with a bar line of the last 3 hours, the busiest device and the eSIM balance |
+| [data-nag](docs/data-nag.md) | Every 250 MB of cellular data, urgent from 1 GB, with a bar line of the last 3 hours, the busiest device, each device's day so far and the eSIM balance; the count survives a restart |
 
 ## battery-nag
 

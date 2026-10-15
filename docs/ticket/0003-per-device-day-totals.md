@@ -1,6 +1,6 @@
 # 0003: data-nag: per-device totals for the day (`data-nag report`)
 
-Status: open
+Status: done (`data-nag report`, "Today so far" in the push, and the day kept through a restart on flash; see docs/data-nag.md). The `conntrack -E` follow-up below stays open, only if coverage turns out low.
 Priority: medium
 
 ## Why

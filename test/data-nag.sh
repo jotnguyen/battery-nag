@@ -15,7 +15,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 export DATA_NAG_STATE="${tmp}/state" DATA_NAG_CONF="${tmp}/conf" \
   DATA_NAG_BATTERY_CONF="${tmp}/battery-conf" TZ=UTC \
-  DATA_NAG_CONNTRACK="${tmp}/ct" DATA_NAG_LEASES="${tmp}/leases"
+  DATA_NAG_CONNTRACK="${tmp}/ct" DATA_NAG_LEASES="${tmp}/leases" DATA_NAG_SAVED="${tmp}/saved"
 fails=0
 T0=1791918000 # 19:00 UTC
 
@@ -61,6 +61,9 @@ expect() {
 # shellcheck disable=SC2317,SC2329
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
+# fresh: forget everything, in RAM and on "flash", as a new install would.
+fresh() { rm -rf "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".* "${DATA_NAG_SAVED}" "${DATA_NAG_SAVED}".*; }
+
 echo "== a push every 250 MB, urgent from 1 GB, a day starting at noon"
 printf 'DEVICE_NAME=Puli
 ' >"${DATA_NAG_CONF}"
@@ -77,7 +80,7 @@ step 1022 1000 - "past noon: a new day, 100 MB so far"
 step 1024 1350 "p0 Puli cellular 450 MB"
 
 echo "== the push says how fast and whether Wi-Fi is up"
-rm -f "${DATA_NAG_STATE}"
+fresh
 run 0 0 >/dev/null
 msg="$(run 2 600)"
 expect "rate in the message" has "${msg}" "Now 40 Mbit/s"
@@ -86,21 +89,21 @@ msg="$(WIFI=1 run 4 1100)"
 expect "Wi-Fi up in the message" has "${msg}" "Wi-Fi uplink is up"
 
 echo "== no modem device: nothing counted, and the count carries on after"
-rm -f "${DATA_NAG_STATE}"
+fresh
 step 0 100 -
 got="$(env DATA_NAG_NOW=$((T0 + 120)) DATA_NAG_BYTES=none DRY_RUN=1 ${SH} openwrt/data-nag check 2>&1)"
 expect "missing device -> no push" [ -z "${got}" ]
 step 4 650 "p0 Puli cellular 550 MB"
 
 echo "== a failed push is not recorded, so the next run retries it"
-rm -f "${DATA_NAG_STATE}"
+fresh
 printf 'DEVICE_NAME=Puli\nPUSHOVER_USER=u\nPUSHOVER_TOKEN=t\nPUSHOVER_URL=http://127.0.0.1:9/\n' >"${DATA_NAG_CONF}"
 run 0 0 >/dev/null
 DATA_NAG_NOW=$((T0 + 120)) DATA_NAG_BYTES=700000000 DATA_NAG_WIFI=0 ${SH} openwrt/data-nag check 2>/dev/null
 step 4 700 "p0 Puli cellular 700 MB" "retried"
 
 echo "== keys from battery-nag's config; without any keys check pushes nothing"
-rm -f "${DATA_NAG_STATE}"
+fresh
 printf 'DEVICE_NAME=Puli\n' >"${DATA_NAG_CONF}"
 printf 'PUSHOVER_USER=u\nPUSHOVER_TOKEN=t\n' >"${DATA_NAG_BATTERY_CONF}"
 expect "battery-nag keys found" sh -c "DATA_NAG_WIFI=0 ${SH} openwrt/data-nag status | grep -q 'keys set'"
@@ -119,7 +122,7 @@ step 8 1000 "p0 Puli cellular 100 MB"
 step 10 3000 "p0 Puli cellular 2.1 GB" "URGENT_MB empty: never urgent"
 
 echo "== a bar line of the last hours, in 10-minute bars"
-rm -f "${DATA_NAG_STATE}"
+fresh
 printf 'DEVICE_NAME=Puli\n' >"${DATA_NAG_CONF}"
 run 0 0 >/dev/null
 run 10 100 >/dev/null
@@ -131,7 +134,7 @@ bars="$(sed -n "s/^hist='\(.*\)'$/\1/p" "${DATA_NAG_STATE}" | wc -w | tr -d ' ')
 expect "after a long gap only 18 bars (3 h) are kept" [ "${bars}" = 18 ]
 
 echo "== the device that moved the most cellular bytes, and what kind of traffic"
-rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
+fresh
 L=192.168.8 # LAN. Addresses are built from parts, so the hygiene gate sees no literal IP.
 W=203.0.113 # documentation range, standing in for the internet
 printf '1 aa:00:00:00:00:01 %s.50 laptop *\n1 aa:00:00:00:00:02 %s.60 * *\n' "${L}" "${L}" >"${DATA_NAG_LEASES}"
@@ -171,10 +174,66 @@ ct 1400 50 >"${DATA_NAG_CONNTRACK}"
 run 12 1100 >/dev/null
 msg="$(run 14 1300)"
 expect "no cellular address: no device named" sh -c "! printf '%s' '${msg}' | grep -q 'Top now'"
+
+echo "== the day per device: in the push, in report, kept through a restart"
+fresh
+printf 'DEVICE_NAME=Puli\nSTEP_MB=100\n' >"${DATA_NAG_CONF}"
+export DATA_NAG_CELL_IP="${W}.1"
+run 0 0 >/dev/null
+ct 100 50 >"${DATA_NAG_CONNTRACK}"
+run 2 100 >/dev/null
+ct 400 60 >"${DATA_NAG_CONNTRACK}"
+msg="$(run 4 400)"
+expect "two devices: today so far, biggest first" has "${msg}" "Today so far: laptop 300 MB, ${L}.60 10 MB"
+{ ct 400 360; flow udp '17 120' 50 443 1 200; } >"${DATA_NAG_CONNTRACK}"
+run 6 900 >/dev/null
+rep="$(DATA_NAG_NOW=$((T0 + 420)) ${SH} openwrt/data-nag report 2>/dev/null)"
+expect "report: the day's count" has "${rep}" "Cellular since 12:00 (day 20261013): 900 MB"
+expect "report: a device with its kinds, biggest first" has "${rep}" \
+  "  laptop 500 MB: Tailscale tunnel 300 MB, QUIC (YouTube, Google) 200 MB"
+expect "report: an unnamed device by its address" has "${rep}" "  ${L}.60 310 MB: HTTPS 310 MB"
+expect "report: the biggest device first" has "${rep}" "200 MB
+  ${L}.60 310 MB"
+expect "report: how much of the count the devices cover" has "${rep}" "add up to 90% of that"
+expect "report: the hour" has "${rep}" "19:00  900 MB"
+run 14 900 >/dev/null
+rm -rf "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
+rep="$(DATA_NAG_NOW=$((T0 + 900)) ${SH} openwrt/data-nag report 2>/dev/null)"
+expect "after a restart the day's devices come back from flash" has "${rep}" "  laptop 500 MB:"
+run 1030 0 >/dev/null
+rep="$(DATA_NAG_NOW=$((T0 + 62000)) ${SH} openwrt/data-nag report 2>/dev/null)"
+expect "a new day starts an empty table" has "${rep}" "No device has used cellular yet today."
+expect "the hours stay for 48 h across the new day" has "${rep}" "19:00  900 MB"
+unset DATA_NAG_CELL_IP
 rm -f "${DATA_NAG_CONNTRACK}" "${DATA_NAG_LEASES}"
 
+echo "== a restart carries on from the copy on flash"
+fresh
+printf 'DEVICE_NAME=Puli\n' >"${DATA_NAG_CONF}"
+run 0 0 >/dev/null
+step 2 200 -
+expect "copied to flash once cellular moved data" grep -qx 'used=200000000' "${DATA_NAG_SAVED}"
+step 4 240 -
+expect "not copied again within SAVE_MIN" grep -qx 'used=200000000' "${DATA_NAG_SAVED}"
+run 14 240 >/dev/null
+expect "the rest is copied after SAVE_MIN, though cellular is idle now" grep -qx 'used=240000000' "${DATA_NAG_SAVED}"
+rm -f "${DATA_NAG_SAVED}"
+run 30 240 >/dev/null
+expect "idle: nothing written to flash" [ ! -e "${DATA_NAG_SAVED}" ]
+step 32 245 -
+rm -rf "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
+step 34 20 "p0 Puli cellular 265 MB" "restarted: 245 MB from flash plus the counter's 20 MB since the restart"
+step 36 260 "p0 Puli cellular 505 MB" "and the count goes on from there"
+fresh
+printf 'DEVICE_NAME=Puli\nSAVE_MIN=\n' >"${DATA_NAG_CONF}"
+run 0 0 >/dev/null
+step 2 200 -
+expect "SAVE_MIN empty: never written to flash" [ ! -e "${DATA_NAG_SAVED}" ]
+rm -rf "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
+step 4 300 - "SAVE_MIN empty: a restart starts from zero"
+
 echo "== one check at a time"
-rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
+fresh
 printf 'DEVICE_NAME=Puli\n' >"${DATA_NAG_CONF}"
 run 0 0 >/dev/null
 sleep 30 &
@@ -204,7 +263,7 @@ expect "no ICCID: fails" sh -c "! DATA_NAG_UCI_NETWORK='network.lan.proto=static
 expect "no balance in the answer: fails" sh -c "! DATA_NAG_UCI_NETWORK=\"network.m.iccid='1'\" DATA_NAG_EIOTCLUB_JSON='{\"code\":10002}' ${SH} openwrt/data-nag eiotclub 2>/dev/null"
 
 echo "== BALANCE_CMD adds a line, e.g. the provider's count"
-rm -f "${DATA_NAG_STATE}" "${DATA_NAG_STATE}".*
+fresh
 printf 'DEVICE_NAME=Puli\nBALANCE_CMD="echo eSIM left: 5.1 GB of 25 GB"\n' >"${DATA_NAG_CONF}"
 run 0 0 >/dev/null
 msg="$(run 2 300)"
